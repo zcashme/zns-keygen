@@ -1,22 +1,42 @@
-use sev::firmware::guest::Firmware;
+use bech32::{Bech32, Hrp};
+use blake2b_simd::Params as Blake2bParams;
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
+};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use sev::firmware::guest::{DerivedKey, Firmware, GuestFieldSelect};
+use sev::{firmware::guest::AttestationReport, parser::ByteParser};
 use std::env;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+#[cfg(target_arch = "x86_64")]
+use std::hint::spin_loop;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, Zeroizing};
 
-use zns_keys::attestation::{
-    generate_attestation_proof_with_challenge, seal_seed, unseal_seed, verify_report_binding,
-};
-use zns_keys::keyfile::{KeyFile, PlainSeed};
-use zns_keys::seedhash::SeedFingerprint;
-
-const DEFAULT_KEY_FILE: &str = "zns_keys.key";
-const DEFAULT_REPORT: &str = "zns_attestation.report";
+const DEFAULT_SEED_FILE: &str = "zns_seed.sealed";
+const DEFAULT_REPORT_FILE: &str = "zns_attestation.report";
 const DEFAULT_SOCKET: &str = "zns-keys.sock";
 
-type AppResult<T> = Result<T, String>;
+const SEED_LEN: usize = 32;
+const FINGERPRINT_LEN: usize = 32;
+const SEALING_KEY_LEN: usize = 32;
+const NONCE_LEN: usize = 24;
+const TAG_LEN: usize = 16;
+const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
+
+const SEALED_MAGIC: &[u8; 8] = b"ZNSSEED1";
+const SEALED_VERSION: u32 = 1;
+const SEALED_HEADER_LEN: usize = 8 + 4 + FINGERPRINT_LEN;
+const SEALED_FILE_LEN: usize = SEALED_HEADER_LEN + NONCE_LEN + CIPHERTEXT_LEN;
+const FINGERPRINT_PERSONALIZATION: &[u8; 16] = b"ZcashSeedFpV1\0\0\0";
+const FINGERPRINT_HRP: Hrp = Hrp::parse_unchecked("zip32seedfp");
+
+type ZnsResult<T> = Result<T, String>;
 
 fn main() {
     if let Err(err) = run() {
@@ -25,155 +45,133 @@ fn main() {
     }
 }
 
-fn run() -> AppResult<()> {
-    #[cfg(not(target_arch = "x86_64"))]
-    return Err("zns-keys must run on x86_64 AMD SEV-SNP capable CPUs".to_string());
+fn run() -> ZnsResult<()> {
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        usage();
+        return Ok(());
+    }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut args: Vec<String> = env::args().skip(1).collect();
-        if args.is_empty() {
+    let command = args.remove(0);
+    match command.as_str() {
+        "init" => cmd_init(&args),
+        "status" => cmd_status(&args),
+        "attest" => cmd_attest(&args),
+        "verify" => cmd_verify(&args),
+        "serve" => cmd_serve(&args),
+        "help" | "--help" | "-h" => {
             usage();
-            return Ok(());
+            Ok(())
         }
-
-        let command = args.remove(0);
-        match command.as_str() {
-            "init" => cmd_init(&args),
-            "status" => cmd_status(&args),
-            "attest" => cmd_attest(&args),
-            "verify" => cmd_verify(&args),
-            "serve" => cmd_serve(&args),
-            "migrate-export" | "migrate-import" => Err(
-                "migration is intentionally not implemented in v1; add attested DH/HPKE later"
-                    .to_string(),
-            ),
-            "help" | "--help" | "-h" => {
-                usage();
-                Ok(())
-            }
-            other => Err(format!("unknown command `{other}`")),
-        }
+        other => Err(format!("unknown command `{other}`")),
     }
 }
 
 fn usage() {
     eprintln!(
         "\
-zns-keys: SEV-SNP key custody daemon for ZNS
+zns-keys: attested seed custody signer
 
 commands:
-  init [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-  status [--key-file PATH]
-  attest [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-  verify [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-  serve [--key-file PATH] [--socket PATH]
-  migrate-export   (reserved for v2)
-  migrate-import   (reserved for v2)
+  init [--seed-file PATH] [--report PATH] [--challenge-hex HEX64]
+  status [--seed-file PATH]
+  attest [--seed-file PATH] [--report PATH] [--challenge-hex HEX64]
+  verify [--seed-file PATH] [--report PATH] [--challenge-hex HEX64]
+  serve [--seed-file PATH] [--socket PATH]
+
+defaults:
+  seed file: {DEFAULT_SEED_FILE}
+  report:    {DEFAULT_REPORT_FILE}
+  socket:    {DEFAULT_SOCKET}
 "
     );
 }
 
-fn cmd_init(args: &[String]) -> AppResult<()> {
-    let key_file_path = option_path(args, "--key-file", DEFAULT_KEY_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT)?;
+fn cmd_init(args: &[String]) -> ZnsResult<()> {
+    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
+    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
     let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--key-file", "--report", "--challenge-hex"])?;
+    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    if key_file_path.exists() {
+    if seed_file_path.exists() {
         return Err(format!(
-            "key file already exists: {}",
-            key_file_path.display()
+            "sealed seed file already exists: {}",
+            seed_file_path.display()
         ));
     }
     if report_path.exists() {
         return Err(format!(
-            "report file already exists: {}",
+            "attestation report already exists: {}",
             report_path.display()
         ));
     }
 
-    let seed = PlainSeed::generate();
-    let fingerprint = seed.fingerprint();
+    let seed = Seed::generate()?;
+    let fingerprint = seed.fingerprint()?;
+    let report = sev_attestation_report(fingerprint, challenge)?;
+    let sealing_key = derive_sev_sealing_key()?;
+    let sealed_seed = seal_seed(&seed, &sealing_key, fingerprint)?;
 
-    let mut firmware =
-        Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
-    let report = generate_attestation_proof_with_challenge(&mut firmware, &fingerprint, challenge);
-    let sealed_seed = seal_seed(&mut firmware, &seed, &fingerprint);
-
-    let key_file = KeyFile::new(fingerprint, sealed_seed);
-    write_new_file(&key_file_path, &key_file.encode())?;
+    write_new_file(&seed_file_path, &sealed_seed.encode())?;
     write_new_file(&report_path, &report)?;
 
-    println!("initialized zns-keys key file");
-    println!("key file: {}", key_file_path.display());
-    println!("report: {}", report_path.display());
+    println!("initialized zns-keys custody seed");
+    println!("sealed seed file: {}", seed_file_path.display());
+    println!("attestation report: {}", report_path.display());
     println!("fingerprint: {}", fingerprint);
-
     Ok(())
 }
 
-fn cmd_status(args: &[String]) -> AppResult<()> {
-    let key_file_path = option_path(args, "--key-file", DEFAULT_KEY_FILE)?;
-    reject_unknown_options(args, &["--key-file"])?;
+fn cmd_status(args: &[String]) -> ZnsResult<()> {
+    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
+    reject_unknown_options(args, &["--seed-file"])?;
 
-    let key_file = KeyFile::read(&key_file_path)?;
-    println!("key file: {}", key_file_path.display());
-    println!("fingerprint: {}", key_file.fingerprint());
+    let sealed_seed = SealedSeed::read(&seed_file_path)?;
+    println!("sealed seed file: {}", seed_file_path.display());
+    println!("fingerprint: {}", sealed_seed.fingerprint);
     Ok(())
 }
 
-fn cmd_attest(args: &[String]) -> AppResult<()> {
-    let key_file_path = option_path(args, "--key-file", DEFAULT_KEY_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT)?;
+fn cmd_attest(args: &[String]) -> ZnsResult<()> {
+    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
+    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
     let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--key-file", "--report", "--challenge-hex"])?;
+    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    let key_file = KeyFile::read(&key_file_path)?;
-    let mut firmware =
-        Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
-    let report = generate_attestation_proof_with_challenge(
-        &mut firmware,
-        &key_file.fingerprint(),
-        challenge,
-    );
-
+    let sealed_seed = SealedSeed::read(&seed_file_path)?;
+    let report = sev_attestation_report(sealed_seed.fingerprint, challenge)?;
     write_new_file(&report_path, &report)?;
+
     println!("wrote attestation report: {}", report_path.display());
-    println!("fingerprint: {}", key_file.fingerprint());
+    println!("fingerprint: {}", sealed_seed.fingerprint);
     Ok(())
 }
 
-fn cmd_verify(args: &[String]) -> AppResult<()> {
-    let key_file_path = option_path(args, "--key-file", DEFAULT_KEY_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT)?;
+fn cmd_verify(args: &[String]) -> ZnsResult<()> {
+    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
+    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
     let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--key-file", "--report", "--challenge-hex"])?;
+    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    let key_file = KeyFile::read(&key_file_path)?;
+    let sealed_seed = SealedSeed::read(&seed_file_path)?;
     let report = fs::read(&report_path)
         .map_err(|err| format!("failed to read report {}: {err}", report_path.display()))?;
-    verify_report_binding(&report, &key_file.fingerprint(), challenge)?;
+    verify_report_binding(&report, sealed_seed.fingerprint, challenge)?;
 
     println!("report binds expected fingerprint/challenge");
-    println!("fingerprint: {}", key_file.fingerprint());
-    println!("note: this structural check does not validate the AMD VCEK certificate chain");
+    println!("fingerprint: {}", sealed_seed.fingerprint);
+    println!("note: this structural check does not validate the AMD certificate chain");
     Ok(())
 }
 
-fn cmd_serve(args: &[String]) -> AppResult<()> {
-    let key_file_path = option_path(args, "--key-file", DEFAULT_KEY_FILE)?;
+fn cmd_serve(args: &[String]) -> ZnsResult<()> {
+    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
     let socket_path = option_path(args, "--socket", DEFAULT_SOCKET)?;
-    reject_unknown_options(args, &["--key-file", "--socket"])?;
+    reject_unknown_options(args, &["--seed-file", "--socket"])?;
 
-    let key_file = KeyFile::read(&key_file_path)?;
-    let mut firmware =
-        Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
-    let seed = unseal_seed(
-        &mut firmware,
-        key_file.sealed_seed(),
-        &key_file.fingerprint(),
-    );
+    let sealed_seed = SealedSeed::read(&seed_file_path)?;
+    let sealing_key = derive_sev_sealing_key()?;
+    let seed = unseal_seed(&sealed_seed, &sealing_key)?;
 
     prepare_socket_path(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
@@ -187,12 +185,12 @@ fn cmd_serve(args: &[String]) -> AppResult<()> {
 
     println!("zns-keys serving");
     println!("socket: {}", socket_path.display());
-    println!("fingerprint: {}", key_file.fingerprint());
+    println!("fingerprint: {}", sealed_seed.fingerprint);
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle_client(stream, key_file.fingerprint(), &seed) {
+                if let Err(err) = handle_client(stream, sealed_seed.fingerprint, &seed) {
                     eprintln!("client error: {err}");
                 }
             }
@@ -203,11 +201,214 @@ fn cmd_serve(args: &[String]) -> AppResult<()> {
     Ok(())
 }
 
-fn handle_client(
-    stream: UnixStream,
+struct Seed(Zeroizing<[u8; SEED_LEN]>);
+
+impl Seed {
+    fn generate() -> ZnsResult<Seed> {
+        let mut seed = Seed(Zeroizing::new([0u8; SEED_LEN]));
+        fill_entropy(&mut seed.0[..])?;
+        Ok(seed)
+    }
+
+    fn from_plaintext(plaintext: &mut [u8]) -> ZnsResult<Seed> {
+        if plaintext.len() != SEED_LEN {
+            return Err(format!(
+                "decrypted seed length was {}, expected {SEED_LEN}",
+                plaintext.len()
+            ));
+        }
+
+        let mut seed = Seed(Zeroizing::new([0u8; SEED_LEN]));
+        seed.0.copy_from_slice(plaintext);
+        plaintext.zeroize();
+        Ok(seed)
+    }
+
+    fn expose_for_signing<R>(&self, f: impl FnOnce(&[u8; SEED_LEN]) -> R) -> R {
+        f(&self.0)
+    }
+
+    fn fingerprint(&self) -> ZnsResult<SeedFingerprint> {
+        self.expose_for_signing(|bytes| SeedFingerprint::from_seed(bytes))
+    }
+}
+
+struct SealingKey(Zeroizing<[u8; SEALING_KEY_LEN]>);
+
+impl SealingKey {
+    fn as_bytes(&self) -> &[u8; SEALING_KEY_LEN] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SeedFingerprint([u8; FINGERPRINT_LEN]);
+
+impl SeedFingerprint {
+    fn from_seed(seed: &[u8; SEED_LEN]) -> ZnsResult<SeedFingerprint> {
+        Ok(SeedFingerprint(
+            Blake2bParams::new()
+                .hash_length(FINGERPRINT_LEN)
+                .personal(FINGERPRINT_PERSONALIZATION)
+                .to_state()
+                .update(&[SEED_LEN as u8])
+                .update(seed)
+                .finalize()
+                .as_bytes()
+                .try_into()
+                .map_err(|_| "fingerprint hash length mismatch".to_string())?,
+        ))
+    }
+
+    fn from_bytes(bytes: [u8; FINGERPRINT_LEN]) -> SeedFingerprint {
+        SeedFingerprint(bytes)
+    }
+
+    fn to_bytes(self) -> [u8; FINGERPRINT_LEN] {
+        self.0
+    }
+}
+
+impl fmt::Display for SeedFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match bech32::encode::<Bech32>(FINGERPRINT_HRP, &self.0) {
+            Ok(encoded) => f.write_str(&encoded),
+            Err(_) => {
+                for byte in self.0 {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SealedSeed {
     fingerprint: SeedFingerprint,
-    seed: &PlainSeed,
-) -> AppResult<()> {
+    nonce: [u8; NONCE_LEN],
+    ciphertext: [u8; CIPHERTEXT_LEN],
+}
+
+impl SealedSeed {
+    fn encode(&self) -> [u8; SEALED_FILE_LEN] {
+        let mut out = [0u8; SEALED_FILE_LEN];
+        out[0..8].copy_from_slice(SEALED_MAGIC);
+        out[8..12].copy_from_slice(&SEALED_VERSION.to_le_bytes());
+        out[12..44].copy_from_slice(&self.fingerprint.to_bytes());
+        out[44..68].copy_from_slice(&self.nonce);
+        out[68..SEALED_FILE_LEN].copy_from_slice(&self.ciphertext);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> ZnsResult<SealedSeed> {
+        if bytes.len() != SEALED_FILE_LEN {
+            return Err(format!(
+                "invalid sealed seed length: expected {SEALED_FILE_LEN}, got {}",
+                bytes.len()
+            ));
+        }
+        if &bytes[0..8] != SEALED_MAGIC {
+            return Err("invalid sealed seed magic".to_string());
+        }
+
+        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("version length fixed"));
+        if version != SEALED_VERSION {
+            return Err(format!("unsupported sealed seed version: {version}"));
+        }
+
+        Ok(SealedSeed {
+            fingerprint: SeedFingerprint::from_bytes(
+                bytes[12..44].try_into().expect("fingerprint length fixed"),
+            ),
+            nonce: bytes[44..68].try_into().expect("nonce length fixed"),
+            ciphertext: bytes[68..SEALED_FILE_LEN]
+                .try_into()
+                .expect("ciphertext length fixed"),
+        })
+    }
+
+    fn read(path: &Path) -> ZnsResult<SealedSeed> {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .map_err(|err| format!("failed to open sealed seed file {}: {err}", path.display()))?
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("failed to read sealed seed file {}: {err}", path.display()))?;
+        SealedSeed::decode(&bytes)
+    }
+}
+
+fn seal_seed(
+    seed: &Seed,
+    sealing_key: &SealingKey,
+    fingerprint: SeedFingerprint,
+) -> ZnsResult<SealedSeed> {
+    let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
+        .map_err(|_| "invalid sealing key length".to_string())?;
+
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_entropy(&mut nonce)?;
+    let aad = seal_aad(fingerprint);
+    let nonce_ref =
+        <&XNonce>::try_from(nonce.as_slice()).map_err(|_| "invalid nonce length".to_string())?;
+    let ciphertext = seed.expose_for_signing(|seed_bytes| {
+        cipher.encrypt(
+            nonce_ref,
+            Payload {
+                msg: seed_bytes,
+                aad: &aad,
+            },
+        )
+    });
+    let ciphertext = ciphertext.map_err(|_| "failed to encrypt seed".to_string())?;
+
+    Ok(SealedSeed {
+        fingerprint,
+        nonce,
+        ciphertext: ciphertext
+            .as_slice()
+            .try_into()
+            .map_err(|_| "sealed seed ciphertext length mismatch".to_string())?,
+    })
+}
+
+fn unseal_seed(sealed_seed: &SealedSeed, sealing_key: &SealingKey) -> ZnsResult<Seed> {
+    let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
+        .map_err(|_| "invalid sealing key length".to_string())?;
+    let aad = seal_aad(sealed_seed.fingerprint);
+    let nonce = <&XNonce>::try_from(sealed_seed.nonce.as_slice())
+        .map_err(|_| "invalid nonce length".to_string())?;
+
+    let mut plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &sealed_seed.ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "failed to decrypt sealed seed".to_string())?;
+
+    let seed = Seed::from_plaintext(&mut plaintext)?;
+    plaintext.zeroize();
+
+    let actual_fingerprint = seed.fingerprint()?;
+    if actual_fingerprint != sealed_seed.fingerprint {
+        return Err("decrypted seed fingerprint mismatch".to_string());
+    }
+
+    Ok(seed)
+}
+
+fn seal_aad(fingerprint: SeedFingerprint) -> [u8; SEALED_HEADER_LEN] {
+    let mut aad = [0u8; SEALED_HEADER_LEN];
+    aad[0..8].copy_from_slice(SEALED_MAGIC);
+    aad[8..12].copy_from_slice(&SEALED_VERSION.to_le_bytes());
+    aad[12..44].copy_from_slice(&fingerprint.to_bytes());
+    aad
+}
+
+fn handle_client(stream: UnixStream, fingerprint: SeedFingerprint, seed: &Seed) -> ZnsResult<()> {
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -228,37 +429,137 @@ fn handle_client(
         let response = handle_request(line.trim_end(), fingerprint, seed);
         writer
             .write_all(response.as_bytes())
+            .and_then(|_| writer.write_all(b"\n"))
             .map_err(|err| format!("failed to write response: {err}"))?;
-        writer
-            .write_all(b"\n")
-            .map_err(|err| format!("failed to write response newline: {err}"))?;
     }
 }
 
-fn handle_request(request: &str, fingerprint: SeedFingerprint, seed: &PlainSeed) -> String {
+fn handle_request(request: &str, fingerprint: SeedFingerprint, seed: &Seed) -> String {
     if request == "status" {
         return format!("OK fingerprint {}", fingerprint);
-    }
-
-    if request == "attest" {
-        return "ERR attest over RPC is not implemented; use `zns-keys attest`".to_string();
     }
 
     if let Some(rest) = request.strip_prefix("sign ") {
         let Ok(message) = decode_hex(rest) else {
             return "ERR sign payload must be hex".to_string();
         };
-        return sign_orchard_placeholder(seed, &message);
+        return sign_placeholder(seed, &message);
     }
 
-    "ERR unknown command; expected status, attest, or sign <hex>".to_string()
+    "ERR unknown command; expected status or sign <hex>".to_string()
 }
 
-fn sign_orchard_placeholder(_seed: &PlainSeed, _message: &[u8]) -> String {
-    "ERR Orchard/Pallas signing is not implemented in this crate yet".to_string()
+fn sign_placeholder(_seed: &Seed, _message: &[u8]) -> String {
+    "ERR signing is not implemented in v0".to_string()
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
+#[cfg(target_arch = "x86_64")]
+fn fill_entropy(dest: &mut [u8]) -> ZnsResult<()> {
+    if dest.is_empty() {
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    while offset < dest.len() {
+        let mut value = 0u64;
+        let mut success = false;
+
+        for _ in 0..10_000 {
+            unsafe {
+                if core::arch::x86_64::_rdseed64_step(&mut value) == 1 {
+                    success = true;
+                    break;
+                }
+            }
+            spin_loop();
+        }
+
+        if !success {
+            return Err("RDSEED hardware entropy was unavailable".to_string());
+        }
+
+        let bytes = value.to_ne_bytes();
+        let take = std::cmp::min(bytes.len(), dest.len() - offset);
+        dest[offset..offset + take].copy_from_slice(&bytes[..take]);
+        value.zeroize();
+        offset += take;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn fill_entropy(_dest: &mut [u8]) -> ZnsResult<()> {
+    Err("zns-keys v0 requires x86_64 RDSEED entropy".to_string())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn derive_sev_sealing_key() -> ZnsResult<SealingKey> {
+    let mut firmware =
+        Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
+    let mut guest_fields = GuestFieldSelect::default();
+    guest_fields.set_measurement(true);
+
+    let request = DerivedKey::new(false, guest_fields, 0, 0, 0, None);
+    let mut key = firmware
+        .get_derived_key(None, request)
+        .map_err(|err| format!("failed to derive SEV-SNP sealing key: {err}"))?;
+
+    let sealing_key = SealingKey(Zeroizing::new(key));
+    key.zeroize();
+    Ok(sealing_key)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+fn derive_sev_sealing_key() -> ZnsResult<SealingKey> {
+    Err("SEV-SNP sealing requires Linux x86_64 with /dev/sev-guest".to_string())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn sev_attestation_report(
+    fingerprint: SeedFingerprint,
+    challenge: [u8; SEED_LEN],
+) -> ZnsResult<Vec<u8>> {
+    let report_data = report_data(fingerprint, challenge);
+    let mut firmware =
+        Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
+    firmware
+        .get_report(None, Some(report_data), None)
+        .map_err(|err| format!("failed to get SEV-SNP attestation report: {err}"))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+fn sev_attestation_report(
+    _fingerprint: SeedFingerprint,
+    _challenge: [u8; SEED_LEN],
+) -> ZnsResult<Vec<u8>> {
+    Err("SEV-SNP attestation requires Linux x86_64 with /dev/sev-guest".to_string())
+}
+
+fn report_data(fingerprint: SeedFingerprint, challenge: [u8; SEED_LEN]) -> [u8; 64] {
+    let mut report_data = [0u8; 64];
+    report_data[0..32].copy_from_slice(&fingerprint.to_bytes());
+    report_data[32..64].copy_from_slice(&challenge);
+    report_data
+}
+
+fn verify_report_binding(
+    report_bytes: &[u8],
+    fingerprint: SeedFingerprint,
+    challenge: [u8; SEED_LEN],
+) -> ZnsResult<()> {
+    let report = AttestationReport::from_bytes(report_bytes)
+        .map_err(|err| format!("failed to parse SEV-SNP report: {err}"))?;
+    let expected = report_data(fingerprint, challenge);
+
+    if report.report_data != expected {
+        return Err("report_data does not bind expected fingerprint/challenge".to_string());
+    }
+
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> ZnsResult<()> {
     let tmp = temp_path(path)?;
     let mut file = OpenOptions::new()
         .write(true)
@@ -267,7 +568,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
         .open(&tmp)
         .map_err(|err| format!("failed to create temp file {}: {err}", tmp.display()))?;
 
-    let write_result = (|| -> AppResult<()> {
+    let result = (|| -> ZnsResult<()> {
         file.write_all(bytes)
             .map_err(|err| format!("failed to write temp file {}: {err}", tmp.display()))?;
         file.sync_all()
@@ -285,14 +586,14 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
         Ok(())
     })();
 
-    if write_result.is_err() {
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
 
-    write_result
+    result
 }
 
-fn temp_path(path: &Path) -> AppResult<PathBuf> {
+fn temp_path(path: &Path) -> ZnsResult<PathBuf> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
         .file_name()
@@ -306,7 +607,7 @@ fn temp_path(path: &Path) -> AppResult<PathBuf> {
     })
 }
 
-fn sync_parent(path: &Path) -> AppResult<()> {
+fn sync_parent(path: &Path) -> ZnsResult<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -321,7 +622,7 @@ fn sync_parent(path: &Path) -> AppResult<()> {
         })
 }
 
-fn prepare_socket_path(path: &Path) -> AppResult<()> {
+fn prepare_socket_path(path: &Path) -> ZnsResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_socket() {
@@ -344,7 +645,7 @@ fn prepare_socket_path(path: &Path) -> AppResult<()> {
     }
 }
 
-fn option_path(args: &[String], name: &str, default: &str) -> AppResult<PathBuf> {
+fn option_path(args: &[String], name: &str, default: &str) -> ZnsResult<PathBuf> {
     let mut value = None;
     let mut i = 0;
     while i < args.len() {
@@ -361,8 +662,8 @@ fn option_path(args: &[String], name: &str, default: &str) -> AppResult<PathBuf>
     Ok(value.unwrap_or_else(|| PathBuf::from(default)))
 }
 
-fn option_challenge(args: &[String]) -> AppResult<[u8; 32]> {
-    let mut challenge = [0u8; 32];
+fn option_challenge(args: &[String]) -> ZnsResult<[u8; SEED_LEN]> {
+    let mut challenge = [0u8; SEED_LEN];
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--challenge-hex" {
@@ -370,8 +671,10 @@ fn option_challenge(args: &[String]) -> AppResult<[u8; 32]> {
                 return Err("missing value for --challenge-hex".to_string());
             };
             let decoded = decode_hex(next)?;
-            if decoded.len() != 32 {
-                return Err("--challenge-hex must decode to exactly 32 bytes".to_string());
+            if decoded.len() != SEED_LEN {
+                return Err(format!(
+                    "--challenge-hex must decode to exactly {SEED_LEN} bytes"
+                ));
             }
             challenge.copy_from_slice(&decoded);
             i += 2;
@@ -382,12 +685,15 @@ fn option_challenge(args: &[String]) -> AppResult<[u8; 32]> {
     Ok(challenge)
 }
 
-fn reject_unknown_options(args: &[String], allowed: &[&str]) -> AppResult<()> {
+fn reject_unknown_options(args: &[String], allowed: &[&str]) -> ZnsResult<()> {
     let mut i = 0;
     while i < args.len() {
         if args[i].starts_with("--") {
             if !allowed.contains(&args[i].as_str()) {
                 return Err(format!("unknown option `{}`", args[i]));
+            }
+            if i + 1 >= args.len() {
+                return Err(format!("missing value for {}", args[i]));
             }
             i += 2;
         } else {
@@ -397,7 +703,7 @@ fn reject_unknown_options(args: &[String], allowed: &[&str]) -> AppResult<()> {
     Ok(())
 }
 
-fn decode_hex(input: &str) -> AppResult<Vec<u8>> {
+fn decode_hex(input: &str) -> ZnsResult<Vec<u8>> {
     let input = input.trim();
     if input.len() % 2 != 0 {
         return Err("hex input must have even length".to_string());
@@ -415,7 +721,7 @@ fn decode_hex(input: &str) -> AppResult<Vec<u8>> {
     Ok(out)
 }
 
-fn hex_value(byte: u8) -> AppResult<u8> {
+fn hex_value(byte: u8) -> ZnsResult<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),

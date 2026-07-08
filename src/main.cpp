@@ -6,11 +6,10 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <x86intrin.h>
-#include <fstream>
-// Assuming OpenSSL for ChaCha20-Poly1305
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 
-// Definitions for SEV-SNP guest ioctls (simplified)
+// Definitions for SEV-SNP guest ioctls
 #define SNP_GET_REPORT _IOWR('S', 0, struct snp_guest_request_ioctl)
 #define SNP_GET_DERIVED_KEY _IOWR('S', 1, struct snp_guest_request_ioctl)
 
@@ -21,7 +20,6 @@ struct snp_guest_request_ioctl {
     uint64_t fw_err;
 };
 
-// Simplified structures for SEV-SNP
 struct snp_report_req {
     uint8_t report_data[64];
     uint32_t vmpl;
@@ -32,7 +30,7 @@ struct snp_report_resp {
     uint32_t status;
     uint32_t report_size;
     uint8_t reserved[24];
-    uint8_t report[1184]; // The actual attestation report
+    uint8_t report[1184]; 
 };
 
 struct snp_derived_key_req {
@@ -52,18 +50,32 @@ struct snp_derived_key_resp {
 
 void generate_rdseed_bytes(uint8_t* dest, size_t len) {
     if (len % 8 != 0) {
-        std::cerr << "Length must be a multiple of 8" << std::endl;
+        std::cerr << "Length must be a multiple of 8\n";
         exit(1);
     }
     
     size_t chunks = len / 8;
     for (size_t i = 0; i < chunks; i++) {
         unsigned long long val = 0;
-        // Attempt to read hardware entropy
-        while (_rdseed64_step(&val) != 1) {
-            _mm_pause(); // Yield if the hardware entropy pool is empty
+        int retries = 0;
+        bool success = false;
+        
+        // Audit Finding #11: Bound the RDSEED spin loop to prevent hanging
+        while (retries < 10000) {
+            if (_rdseed64_step(&val) == 1) {
+                memcpy(dest + (i * 8), &val, 8);
+                success = true;
+                break;
+            } else {
+                _mm_pause();
+                retries++;
+            }
         }
-        memcpy(dest + (i * 8), &val, 8);
+        
+        if (!success) {
+            std::cerr << "Hardware entropy pool exhausted after 10,000 retries. Aborting.\n";
+            exit(1);
+        }
     }
 }
 
@@ -72,8 +84,6 @@ std::vector<uint8_t> generate_attestation_proof(int fd, const uint8_t* fingerpri
     
     snp_report_req req;
     memset(&req, 0, sizeof(req));
-    
-    // Copy the 32-byte fingerprint into the first 32 bytes of report_data
     memcpy(req.report_data, fingerprint, 32);
     
     snp_report_resp resp;
@@ -90,10 +100,14 @@ std::vector<uint8_t> generate_attestation_proof(int fd, const uint8_t* fingerpri
         exit(1);
     }
     
-    // We'll just return the struct as bytes for the proof
+    // Audit Finding #5: Check firmware status to prevent silent failures
+    if (ioctl_req.fw_err != 0 || resp.status != 0) {
+        std::cerr << "Firmware error during attestation report generation. Aborting.\n";
+        exit(1);
+    }
+    
     std::vector<uint8_t> report_bytes(sizeof(resp.report));
     memcpy(report_bytes.data(), resp.report, sizeof(resp.report));
-    
     return report_bytes;
 }
 
@@ -102,7 +116,6 @@ std::vector<uint8_t> seal_to_hardware(int fd, const uint8_t* seed) {
     
     snp_derived_key_req req;
     memset(&req, 0, sizeof(req));
-    // GuestFieldSelect::MEASUREMENT (BIT 0 = 1) equivalent
     req.guest_field_select = 1; 
     
     snp_derived_key_resp resp;
@@ -119,92 +132,159 @@ std::vector<uint8_t> seal_to_hardware(int fd, const uint8_t* seed) {
         exit(1);
     }
     
+    // Audit Finding #5: Check derived key firmware status
+    if (ioctl_req.fw_err != 0 || resp.status != 0) {
+        std::cerr << "Firmware error during hardware key derivation. Aborting.\n";
+        OPENSSL_cleanse(resp.key, sizeof(resp.key));
+        exit(1);
+    }
+    
     std::cout << "Encrypting seed with AMD hardware-derived key...\n";
     
     uint8_t nonce[12];
     uint8_t raw_nonce_buf[16];
     generate_rdseed_bytes(raw_nonce_buf, sizeof(raw_nonce_buf));
     memcpy(nonce, raw_nonce_buf, 12);
+    OPENSSL_cleanse(raw_nonce_buf, sizeof(raw_nonce_buf));
     
-    // Using OpenSSL for ChaCha20-Poly1305
+    // Audit Finding #4: Check ctx for NULL
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, resp.key, nonce);
+    if (!ctx) {
+        std::cerr << "EVP_CIPHER_CTX_new failed\n";
+        OPENSSL_cleanse(resp.key, sizeof(resp.key));
+        exit(1);
+    }
     
-    // WARNING: In C++, the developer must explicitly zeroize the key buffer
-    // memset(resp.key, 0, sizeof(resp.key)); 
-    // ^ If they forget this or if compiler optimizes it out, key leaks in RAM!
+    // Audit Finding #4: Check AEAD returns explicitly
+    if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, resp.key, nonce) != 1) {
+        std::cerr << "EVP_EncryptInit_ex failed\n";
+        OPENSSL_cleanse(resp.key, sizeof(resp.key));
+        EVP_CIPHER_CTX_free(ctx);
+        exit(1);
+    }
     
-    std::vector<uint8_t> ciphertext(32); // 32 bytes seed
+    // Audit Finding #3: Explicitly zeroize hardware key immediately after feeding it to the cipher
+    OPENSSL_cleanse(resp.key, sizeof(resp.key)); 
+    
+    std::vector<uint8_t> ciphertext(32);
     int len = 0;
-    EVP_EncryptUpdate(ctx, ciphertext.data(), &len, seed, 32);
+    if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len, seed, 32) != 1) {
+        std::cerr << "EVP_EncryptUpdate failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        exit(1);
+    }
     
     int ciphertext_len = len;
-    EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len);
+    if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len) != 1) {
+        std::cerr << "EVP_EncryptFinal_ex failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        exit(1);
+    }
     ciphertext_len += len;
     
+    if (ciphertext_len != 32) {
+        std::cerr << "Ciphertext length mismatch\n";
+        EVP_CIPHER_CTX_free(ctx);
+        exit(1);
+    }
+    
     uint8_t mac[16];
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, mac);
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, mac) != 1) {
+        std::cerr << "Failed to get MAC tag\n";
+        EVP_CIPHER_CTX_free(ctx);
+        exit(1);
+    }
+    
     EVP_CIPHER_CTX_free(ctx);
     
-    // Construct the 60-byte blob
     std::vector<uint8_t> sealed_blob(60);
     memcpy(sealed_blob.data(), nonce, 12);
     memcpy(sealed_blob.data() + 12, ciphertext.data(), 32);
     memcpy(sealed_blob.data() + 44, mac, 16);
     
+    // Cleanse stack variables before returning
+    OPENSSL_cleanse(nonce, sizeof(nonce));
+    OPENSSL_cleanse(mac, sizeof(mac));
+    
     return sealed_blob;
+}
+
+// Helper to write securely (Audit Finding #6 & #7)
+void write_secure_file(const char* filepath, const std::vector<uint8_t>& data) {
+    // O_EXCL prevents symlink follow, 0600 prevents world-reads
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        perror("Failed to safely open file for writing (O_EXCL)");
+        exit(1);
+    }
+    
+    ssize_t written = ::write(fd, data.data(), data.size());
+    if (written < 0 || (size_t)written != data.size()) {
+        perror("Failed to write full file data");
+        close(fd);
+        exit(1);
+    }
+    
+    close(fd);
 }
 
 int main() {
     std::cout << "=== ZNS Mint: AMD SEV-SNP Key Generation Ceremony ===\n";
     
-    // Step 1: Hardware Entropy
-    uint8_t seed[32]; // Notice this is a raw array, not a specialized type
+    uint8_t seed[32];
     generate_rdseed_bytes(seed, sizeof(seed));
     
-    // Create a mock fingerprint (since zip32 is rust-specific)
-    // We'll just hash the seed in real life. Let's pretend this is the fingerprint.
+    // Audit Finding #1: Proper one-way fingerprint commitment (mimicking Rust blake2b behavior)
     uint8_t fingerprint[32];
-    for(int i = 0; i < 32; i++) fingerprint[i] = seed[i] ^ 0xAA; 
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        std::cerr << "Failed to create MD context\n";
+        OPENSSL_cleanse(seed, sizeof(seed));
+        exit(1);
+    }
+    
+    // Using SHA-256 (in lieu of Blake2b-256 for a standard OpenSSL 1.1 environment)
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        std::cerr << "Failed to init digest\n";
+        OPENSSL_cleanse(seed, sizeof(seed));
+        exit(1);
+    }
+    
+    const char* personalization = "ZcashSeedFpV1\0\0\0";
+    uint8_t seed_len = 32;
+    EVP_DigestUpdate(mdctx, personalization, 16);
+    EVP_DigestUpdate(mdctx, &seed_len, 1);
+    EVP_DigestUpdate(mdctx, seed, 32);
+    
+    unsigned int md_len = 0;
+    EVP_DigestFinal_ex(mdctx, fingerprint, &md_len);
+    EVP_MD_CTX_free(mdctx);
     
     std::cout << "✅ Generated true hardware entropy via RDSEED.\n";
-    // WARNING: It's very easy to accidentally print the secret in C++
-    // std::cout << "Seed is: " << seed << "\n"; // This could accidentally leak!
     
     int fd = open("/dev/sev-guest", O_RDWR);
     if (fd < 0) {
-        std::cerr << "Failed to open /dev/sev-guest (is this an SEV-SNP VM?)\n";
-        // We'll continue for demonstration purposes or exit in production
-        // exit(1);
+        // Audit Finding #2: Fail closed instead of open
+        std::cerr << "Failed to open /dev/sev-guest. Aborting ceremony.\n";
+        OPENSSL_cleanse(seed, sizeof(seed));
+        exit(1);
     }
     
-    // Step 2: Cryptographic Proof
-    if (fd >= 0) {
-        auto report_bytes = generate_attestation_proof(fd, fingerprint);
-        std::ofstream report_file("zns_attestation.report", std::ios::binary);
-        report_file.write(reinterpret_cast<const char*>(report_bytes.data()), report_bytes.size());
-        std::cout << "✅ Saved AMD hardware signature proof to `zns_attestation.report`\n";
-    }
+    auto report_bytes = generate_attestation_proof(fd, fingerprint);
+    write_secure_file("zns_attestation.report", report_bytes);
+    std::cout << "✅ Saved AMD hardware signature proof to `zns_attestation.report`\n";
 
-    // Step 3: Hardware Sealing
-    if (fd >= 0) {
-        auto sealed_blob = seal_to_hardware(fd, seed);
-        std::ofstream sealed_file("sealed_seed.bin", std::ios::binary);
-        sealed_file.write(reinterpret_cast<const char*>(sealed_blob.data()), sealed_blob.size());
-        std::cout << "✅ Saved 60-byte hardware-sealed encrypted seed to `sealed_seed.bin`\n";
-        
-        close(fd);
-    }
+    auto sealed_blob = seal_to_hardware(fd, seed);
+    write_secure_file("sealed_seed.bin", sealed_blob);
+    std::cout << "✅ Saved 60-byte hardware-sealed encrypted seed to `sealed_seed.bin`\n";
+    
+    close(fd);
     
     std::cout << "=====================================================\n";
-    std::cout << "Ceremony complete. No human has seen the seed.\n";
+    std::cout << "Ceremony complete. Destroying seed in memory.\n";
     
-    // WARNING: In C++, the `seed` array is still sitting in stack memory here.
-    // If we return, the memory might be reused and leaked!
-    // We MUST manually do something like:
-    // memset(seed, 0, sizeof(seed)); 
-    // And even then, `memset` is often optimized away by the compiler!
-    // (We would need OPENSSL_cleanse, explicit_bzero, etc.)
+    // Audit Finding #3: Explicit compiler-safe memory wipe
+    OPENSSL_cleanse(seed, sizeof(seed)); 
     
     return 0;
 }

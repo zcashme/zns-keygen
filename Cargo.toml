@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rand_core = { version = "0.6", features = ["getrandom"] }
-bech32 = "0.11"
+rand_core = "0.10.1"
+bech32 = "0.12.0"
 blake2b_simd = "1.0.4"
-sev = "1.2"
-chacha20poly1305 = { version = "0.10", features = ["zeroize"] }
-zeroize = "1.8"
+sev = "8.0.0"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+zeroize = "1.9.0"

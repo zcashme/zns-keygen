@@ -71,7 +71,9 @@ pub fn generate_attestation_proof(firmware: &mut Firmware, fingerprint: &SeedFin
 pub fn seal_to_hardware(firmware: &mut Firmware, seed: &[u8; 32]) -> [u8; 60] {
     println!("Requesting derived sealing key from AMD Secure Processor...");
     
-    let request = DerivedKey::new(false, GuestFieldSelect::MEASUREMENT, 0, 0, 0);
+    let mut guest_field = GuestFieldSelect::default();
+    guest_field.set_measurement(true);
+    let request = DerivedKey::new(false, guest_field, 0, 0, 0, None);
     
     let mut hardware_key = firmware
         .get_derived_key(None, request)
@@ -79,17 +81,17 @@ pub fn seal_to_hardware(firmware: &mut Firmware, seed: &[u8; 32]) -> [u8; 60] {
 
     println!("Encrypting seed with AMD hardware-derived key...");
     
-    let cipher = ChaCha20Poly1305::new(hardware_key.as_slice().into());
+    let cipher = ChaCha20Poly1305::new_from_slice(hardware_key.as_slice()).expect("Invalid key length");
     hardware_key.zeroize();
     
     let mut nonce_bytes = [0u8; 12];
     let mut raw_nonce_buf = [0u8; 16];
     generate_rdseed_bytes(&mut raw_nonce_buf);
     nonce_bytes.copy_from_slice(&raw_nonce_buf[0..12]);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     
     let ciphertext = cipher
-        .encrypt(nonce, seed.as_slice())
+        .encrypt(&nonce, seed.as_slice())
         .expect("Encryption failure");
         
     assert_eq!(ciphertext.len(), 48, "Ciphertext + MAC must be 48 bytes");

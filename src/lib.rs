@@ -1,2 +1,2 @@
-pub mod seedhash;
 pub mod attestation;
+pub mod seedhash;

@@ -42,6 +42,10 @@ impl fmt::Display for SeedFingerprint {
 }
 
 impl SeedFingerprint {
+    pub fn from_bytes(bytes: [u8; 32]) -> SeedFingerprint {
+        SeedFingerprint(bytes)
+    }
+
     /// Derives the fingerprint of the given seed bytes.
     ///
     /// Returns `None` if the length of `seed_bytes` is less than 32 or greater than 252.

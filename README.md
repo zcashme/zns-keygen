@@ -1,22 +1,79 @@
-# ZNS Keygen Ceremony
+# zns-keys
 
-`zns-keygen` is a secure, attested key generation ceremony for Zcash Name Service (ZNS).
+`zns-keys` is the key-custody component for ZNS. It replaces the old one-shot
+`zns-keygen` model with a long-running signer boundary:
 
-It operates entirely within an AMD SEV-SNP Trusted Execution Environment (TEE) to generate, attest, and securely seal a Zcash master seed, guaranteeing that the seed is never exposed to a human or the host operating system.
+```text
+zns-mint -> zns-keys -> signature
+```
 
-## Ceremony Flow
+`zns-mint` never loads the seed. `zns-keys` creates it, seals it for restart,
+unseals it inside the SEV-SNP VM, and exposes a tiny local signing API.
 
-1. **Hardware Entropy:** Harvests true random numbers directly from the AMD silicon via `RDSEED`.
-2. **Cryptographic Proof:** Commits to the seed using a one-way `Blake2b-256` hash (ZIP-32 fingerprint format) and asks the AMD Secure Processor to embed this fingerprint into a signed Attestation Report.
-3. **Hardware Sealing:** Derives a VM-specific encryption key directly from the hardware measurement, and seals the plaintext seed using `ChaCha20-Poly1305`.
-4. **Zeroization:** Wipes all traces of the plaintext seed and hardware key from volatile memory using compiler-safe primitives.
+## Commands
 
-## Artifacts
+```text
+zns-keys init [--state PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys status [--state PATH]
+zns-keys attest [--state PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys verify [--state PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys serve [--state PATH] [--socket PATH]
+```
 
-The ceremony outputs two files to the local directory:
-* `zns_attestation.report`: The AMD SEV-SNP Attestation Report (verifiable by a remote party).
-* `sealed_seed.bin`: The 60-byte encrypted payload containing the seed, which can only be decrypted by the exact same TEE environment.
+Defaults:
 
-## Security
+```text
+state:  zns_keys.state
+report: zns_attestation.report
+socket: zns-keys.sock
+```
 
-This binary is designed with a strict fail-closed philosophy. It will abort immediately if it detects a missing TEE device, firmware errors, or exhaustion of hardware entropy. See `audit.md` for a list of ongoing architectural security enhancements.
+## Lifecycle
+
+1. `init` generates a 32-byte seed using `RDSEED`.
+2. It computes the ZIP-32 seed fingerprint.
+3. It requests an AMD SEV-SNP attestation report binding:
+   - `report_data[0..32] = seed fingerprint`
+   - `report_data[32..64] = optional verifier challenge`
+4. It seals the seed with a SEV-SNP derived key and writes `zns_keys.state`.
+5. `serve` unseals the seed and listens on a Unix socket for `zns-mint`.
+
+## Socket Protocol
+
+The v1 RPC surface is line-oriented and dependency-free:
+
+```text
+status
+sign <hex-message>
+```
+
+Responses are one line:
+
+```text
+OK fingerprint <bech32-fingerprint>
+ERR <message>
+```
+
+Orchard/Pallas signing is not wired yet. The `sign` command currently returns a
+clear error. The signer boundary and sealed custody lifecycle are in place so
+`zns-mint` can be migrated to call `zns-keys` before the Orchard implementation
+is added.
+
+## Migration
+
+`migrate-export` and `migrate-import` are intentionally reserved for v2. The
+intended design is signer-to-signer migration:
+
+1. New `zns-keys` instance creates an attested migration public key.
+2. Old `zns-keys` verifies the new attestation.
+3. Old `zns-keys` encrypts the seed to the new instance.
+4. New `zns-keys` decrypts inside its TEE and seals locally.
+
+No plaintext seed should pass through the operator.
+
+## Security Boundary
+
+This protects the seed from disk/offline theft and from the cloud host when run
+inside a genuine SEV-SNP VM. On managed GCP SEV-SNP, in-guest root is not
+cryptographically blocked from inspecting guest memory or calling
+`SNP_GET_DERIVED_KEY`. The public claim must be scoped accordingly.

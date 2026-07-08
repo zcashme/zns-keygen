@@ -1,7 +1,11 @@
 [package]
-name = "zns-keygen"
+name = "zns-keys"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "zns-keys"
+path = "src/main.rs"
 
 [dependencies]
 rand_core = "0.10.1"

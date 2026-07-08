@@ -17,15 +17,27 @@ pub fn generate_rdseed_bytes(dest: &mut [u8]) {
     let mut i = 0;
     while i < chunks {
         let mut val: u64 = 0;
-        unsafe {
-            if core::arch::x86_64::_rdseed64_step(&mut val) == 1 {
-                let bytes = val.to_ne_bytes();
-                dest[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-                i += 1;
-            } else {
-                spin_loop();
+        let mut retries = 0;
+        let mut success = false;
+        
+        while retries < 10_000 {
+            unsafe {
+                if core::arch::x86_64::_rdseed64_step(&mut val) == 1 {
+                    let bytes = val.to_ne_bytes();
+                    dest[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+                    success = true;
+                    break;
+                } else {
+                    spin_loop();
+                    retries += 1;
+                }
             }
         }
+        
+        if !success {
+            panic!("Hardware entropy pool (RDSEED) exhausted after 10,000 retries. Aborting ceremony.");
+        }
+        i += 1;
     }
 }
 

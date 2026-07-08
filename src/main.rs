@@ -1,4 +1,6 @@
-use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use sev::firmware::guest::Firmware;
 use zeroize::Zeroize;
 
@@ -26,14 +28,24 @@ fn main() {
 
     // Step 2: Cryptographic Proof
     let report_bytes = generate_attestation_proof(&mut firmware, &fingerprint);
-    fs::write("zns_attestation.report", report_bytes)
-        .expect("Failed to write attestation report");
+    let mut report_file = OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_EXCL prevents symlink race conditions
+        .mode(0o600)      // World-readable -> user-only readable
+        .open("zns_attestation.report")
+        .expect("Failed to safely open zns_attestation.report for writing");
+    report_file.write_all(&report_bytes).expect("Failed to write attestation report");
     println!("✅ Saved AMD hardware signature proof to `zns_attestation.report`");
 
     // Step 3: Hardware Sealing
     let sealed_blob = seal_to_hardware(&mut firmware, &raw_seed);
-    fs::write("sealed_seed.bin", sealed_blob)
-        .expect("Failed to write sealed seed");
+    let mut seed_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open("sealed_seed.bin")
+        .expect("Failed to safely open sealed_seed.bin for writing");
+    seed_file.write_all(&sealed_blob).expect("Failed to write sealed seed");
     println!("✅ Saved 60-byte hardware-sealed encrypted seed to `sealed_seed.bin`");
     
     println!("=====================================================");

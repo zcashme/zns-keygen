@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_arch = "x86_64")]
 use std::hint::spin_loop;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -88,75 +88,65 @@ defaults:
 }
 
 fn cmd_init(args: &[String]) -> ZnsResult<()> {
-    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
-    let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
+    let options = Options::parse(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    if seed_file_path.exists() {
+    if options.seed_file.exists() {
         return Err(format!(
             "sealed seed file already exists: {}",
-            seed_file_path.display()
+            options.seed_file.display()
         ));
     }
-    if report_path.exists() {
+    if options.report.exists() {
         return Err(format!(
             "attestation report already exists: {}",
-            report_path.display()
+            options.report.display()
         ));
     }
 
     let seed = Seed::generate()?;
     let fingerprint = seed.fingerprint()?;
-    let report = sev_attestation_report(fingerprint, challenge)?;
+    let report = sev_attestation_report(fingerprint, options.challenge)?;
     let sealing_key = derive_sev_sealing_key()?;
     let sealed_seed = seal_seed(&seed, &sealing_key, fingerprint)?;
 
-    write_new_file(&seed_file_path, &sealed_seed.encode())?;
-    write_new_file(&report_path, &report)?;
+    write_new_file(&options.seed_file, &sealed_seed.encode())?;
+    write_new_file(&options.report, &report)?;
 
     println!("initialized zns-keys custody seed");
-    println!("sealed seed file: {}", seed_file_path.display());
-    println!("attestation report: {}", report_path.display());
+    println!("sealed seed file: {}", options.seed_file.display());
+    println!("attestation report: {}", options.report.display());
     println!("fingerprint: {}", fingerprint);
     Ok(())
 }
 
 fn cmd_status(args: &[String]) -> ZnsResult<()> {
-    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
-    reject_unknown_options(args, &["--seed-file"])?;
+    let options = Options::parse(args, &["--seed-file"])?;
 
-    let sealed_seed = SealedSeed::read(&seed_file_path)?;
-    println!("sealed seed file: {}", seed_file_path.display());
+    let sealed_seed = SealedSeed::read(&options.seed_file)?;
+    println!("sealed seed file: {}", options.seed_file.display());
     println!("fingerprint: {}", sealed_seed.fingerprint);
     Ok(())
 }
 
 fn cmd_attest(args: &[String]) -> ZnsResult<()> {
-    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
-    let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
+    let options = Options::parse(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    let sealed_seed = SealedSeed::read(&seed_file_path)?;
-    let report = sev_attestation_report(sealed_seed.fingerprint, challenge)?;
-    write_new_file(&report_path, &report)?;
+    let sealed_seed = SealedSeed::read(&options.seed_file)?;
+    let report = sev_attestation_report(sealed_seed.fingerprint, options.challenge)?;
+    write_new_file(&options.report, &report)?;
 
-    println!("wrote attestation report: {}", report_path.display());
+    println!("wrote attestation report: {}", options.report.display());
     println!("fingerprint: {}", sealed_seed.fingerprint);
     Ok(())
 }
 
 fn cmd_verify(args: &[String]) -> ZnsResult<()> {
-    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
-    let report_path = option_path(args, "--report", DEFAULT_REPORT_FILE)?;
-    let challenge = option_challenge(args)?;
-    reject_unknown_options(args, &["--seed-file", "--report", "--challenge-hex"])?;
+    let options = Options::parse(args, &["--seed-file", "--report", "--challenge-hex"])?;
 
-    let sealed_seed = SealedSeed::read(&seed_file_path)?;
-    let report = fs::read(&report_path)
-        .map_err(|err| format!("failed to read report {}: {err}", report_path.display()))?;
-    verify_report_binding(&report, sealed_seed.fingerprint, challenge)?;
+    let sealed_seed = SealedSeed::read(&options.seed_file)?;
+    let report = fs::read(&options.report)
+        .map_err(|err| format!("failed to read report {}: {err}", options.report.display()))?;
+    verify_report_binding(&report, sealed_seed.fingerprint, options.challenge)?;
 
     println!("report binds expected fingerprint/challenge");
     println!("fingerprint: {}", sealed_seed.fingerprint);
@@ -165,26 +155,24 @@ fn cmd_verify(args: &[String]) -> ZnsResult<()> {
 }
 
 fn cmd_serve(args: &[String]) -> ZnsResult<()> {
-    let seed_file_path = option_path(args, "--seed-file", DEFAULT_SEED_FILE)?;
-    let socket_path = option_path(args, "--socket", DEFAULT_SOCKET)?;
-    reject_unknown_options(args, &["--seed-file", "--socket"])?;
+    let options = Options::parse(args, &["--seed-file", "--socket"])?;
 
-    let sealed_seed = SealedSeed::read(&seed_file_path)?;
+    let sealed_seed = SealedSeed::read(&options.seed_file)?;
     let sealing_key = derive_sev_sealing_key()?;
     let seed = unseal_seed(&sealed_seed, &sealing_key)?;
 
-    prepare_socket_path(&socket_path)?;
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|err| format!("failed to bind socket {}: {err}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+    prepare_socket_path(&options.socket)?;
+    let listener = UnixListener::bind(&options.socket)
+        .map_err(|err| format!("failed to bind socket {}: {err}", options.socket.display()))?;
+    fs::set_permissions(&options.socket, fs::Permissions::from_mode(0o600)).map_err(|err| {
         format!(
             "failed to set socket permissions {}: {err}",
-            socket_path.display()
+            options.socket.display()
         )
     })?;
 
     println!("zns-keys serving");
-    println!("socket: {}", socket_path.display());
+    println!("socket: {}", options.socket.display());
     println!("fingerprint: {}", sealed_seed.fingerprint);
 
     for stream in listener.incoming() {
@@ -199,6 +187,53 @@ fn cmd_serve(args: &[String]) -> ZnsResult<()> {
     }
 
     Ok(())
+}
+
+struct Options {
+    seed_file: PathBuf,
+    report: PathBuf,
+    socket: PathBuf,
+    challenge: [u8; SEED_LEN],
+}
+
+impl Options {
+    fn parse(args: &[String], allowed: &[&str]) -> ZnsResult<Options> {
+        let mut options = Options {
+            seed_file: PathBuf::from(DEFAULT_SEED_FILE),
+            report: PathBuf::from(DEFAULT_REPORT_FILE),
+            socket: PathBuf::from(DEFAULT_SOCKET),
+            challenge: [0u8; SEED_LEN],
+        };
+
+        let mut i = 0;
+        while i < args.len() {
+            let name = &args[i];
+            if !name.starts_with("--") {
+                return Err(format!("unexpected argument `{name}`"));
+            }
+            if !allowed.contains(&name.as_str()) {
+                return Err(format!("unknown option `{name}`"));
+            }
+
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| format!("missing value for {name}"))?;
+
+            match name.as_str() {
+                "--seed-file" => options.seed_file = PathBuf::from(value),
+                "--report" => options.report = PathBuf::from(value),
+                "--socket" => options.socket = PathBuf::from(value),
+                "--challenge-hex" => {
+                    options.challenge = decode_hex_array(value, "--challenge-hex")?;
+                }
+                _ => unreachable!("allowed option has no parser"),
+            }
+
+            i += 2;
+        }
+
+        Ok(options)
+    }
 }
 
 struct Seed(Zeroizing<[u8; SEED_LEN]>);
@@ -229,7 +264,7 @@ impl Seed {
     }
 
     fn fingerprint(&self) -> ZnsResult<SeedFingerprint> {
-        self.expose_for_signing(|bytes| SeedFingerprint::from_seed(bytes))
+        self.expose_for_signing(SeedFingerprint::from_seed)
     }
 }
 
@@ -293,11 +328,9 @@ struct SealedSeed {
 impl SealedSeed {
     fn encode(&self) -> [u8; SEALED_FILE_LEN] {
         let mut out = [0u8; SEALED_FILE_LEN];
-        out[0..8].copy_from_slice(SEALED_MAGIC);
-        out[8..12].copy_from_slice(&SEALED_VERSION.to_le_bytes());
-        out[12..44].copy_from_slice(&self.fingerprint.to_bytes());
-        out[44..68].copy_from_slice(&self.nonce);
-        out[68..SEALED_FILE_LEN].copy_from_slice(&self.ciphertext);
+        out[..SEALED_HEADER_LEN].copy_from_slice(&sealed_header(self.fingerprint));
+        out[SEALED_HEADER_LEN..SEALED_HEADER_LEN + NONCE_LEN].copy_from_slice(&self.nonce);
+        out[SEALED_HEADER_LEN + NONCE_LEN..].copy_from_slice(&self.ciphertext);
         out
     }
 
@@ -329,10 +362,7 @@ impl SealedSeed {
     }
 
     fn read(path: &Path) -> ZnsResult<SealedSeed> {
-        let mut bytes = Vec::new();
-        File::open(path)
-            .map_err(|err| format!("failed to open sealed seed file {}: {err}", path.display()))?
-            .read_to_end(&mut bytes)
+        let bytes = fs::read(path)
             .map_err(|err| format!("failed to read sealed seed file {}: {err}", path.display()))?;
         SealedSeed::decode(&bytes)
     }
@@ -401,11 +431,15 @@ fn unseal_seed(sealed_seed: &SealedSeed, sealing_key: &SealingKey) -> ZnsResult<
 }
 
 fn seal_aad(fingerprint: SeedFingerprint) -> [u8; SEALED_HEADER_LEN] {
-    let mut aad = [0u8; SEALED_HEADER_LEN];
-    aad[0..8].copy_from_slice(SEALED_MAGIC);
-    aad[8..12].copy_from_slice(&SEALED_VERSION.to_le_bytes());
-    aad[12..44].copy_from_slice(&fingerprint.to_bytes());
-    aad
+    sealed_header(fingerprint)
+}
+
+fn sealed_header(fingerprint: SeedFingerprint) -> [u8; SEALED_HEADER_LEN] {
+    let mut header = [0u8; SEALED_HEADER_LEN];
+    header[0..8].copy_from_slice(SEALED_MAGIC);
+    header[8..12].copy_from_slice(&SEALED_VERSION.to_le_bytes());
+    header[12..44].copy_from_slice(&fingerprint.to_bytes());
+    header
 }
 
 fn handle_client(stream: UnixStream, fingerprint: SeedFingerprint, seed: &Seed) -> ZnsResult<()> {
@@ -645,67 +679,9 @@ fn prepare_socket_path(path: &Path) -> ZnsResult<()> {
     }
 }
 
-fn option_path(args: &[String], name: &str, default: &str) -> ZnsResult<PathBuf> {
-    let mut value = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == name {
-            let Some(next) = args.get(i + 1) else {
-                return Err(format!("missing value for {name}"));
-            };
-            value = Some(PathBuf::from(next));
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    Ok(value.unwrap_or_else(|| PathBuf::from(default)))
-}
-
-fn option_challenge(args: &[String]) -> ZnsResult<[u8; SEED_LEN]> {
-    let mut challenge = [0u8; SEED_LEN];
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--challenge-hex" {
-            let Some(next) = args.get(i + 1) else {
-                return Err("missing value for --challenge-hex".to_string());
-            };
-            let decoded = decode_hex(next)?;
-            if decoded.len() != SEED_LEN {
-                return Err(format!(
-                    "--challenge-hex must decode to exactly {SEED_LEN} bytes"
-                ));
-            }
-            challenge.copy_from_slice(&decoded);
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    Ok(challenge)
-}
-
-fn reject_unknown_options(args: &[String], allowed: &[&str]) -> ZnsResult<()> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i].starts_with("--") {
-            if !allowed.contains(&args[i].as_str()) {
-                return Err(format!("unknown option `{}`", args[i]));
-            }
-            if i + 1 >= args.len() {
-                return Err(format!("missing value for {}", args[i]));
-            }
-            i += 2;
-        } else {
-            return Err(format!("unexpected argument `{}`", args[i]));
-        }
-    }
-    Ok(())
-}
-
 fn decode_hex(input: &str) -> ZnsResult<Vec<u8>> {
     let input = input.trim();
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err("hex input must have even length".to_string());
     }
 
@@ -719,6 +695,16 @@ fn decode_hex(input: &str) -> ZnsResult<Vec<u8>> {
         i += 2;
     }
     Ok(out)
+}
+
+fn decode_hex_array<const N: usize>(input: &str, name: &str) -> ZnsResult<[u8; N]> {
+    let decoded = decode_hex(input)?;
+    decoded.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "{name} must decode to exactly {N} bytes, got {}",
+            bytes.len()
+        )
+    })
 }
 
 fn hex_value(byte: u8) -> ZnsResult<u8> {

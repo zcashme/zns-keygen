@@ -7,6 +7,7 @@ use sev::parser::ByteParser;
 use std::hint::spin_loop;
 use zeroize::Zeroize;
 
+use crate::keyfile::{PlainSeed, SealedSeed};
 use crate::seedhash::SeedFingerprint;
 
 pub const SEALED_SEED_LEN: usize = 60;
@@ -102,11 +103,11 @@ pub fn verify_report_binding(
 }
 
 /// 3. The Hardware Storage: Ask the AMD silicon for a key derived from our exact ISO hash.
-pub fn seal_to_hardware(
+pub fn seal_seed(
     firmware: &mut Firmware,
-    seed: &[u8; 32],
+    seed: &PlainSeed,
     fingerprint: &SeedFingerprint,
-) -> [u8; SEALED_SEED_LEN] {
+) -> SealedSeed {
     println!("Requesting derived sealing key from AMD Secure Processor...");
 
     let mut hardware_key = derive_sealing_key(firmware);
@@ -124,7 +125,7 @@ pub fn seal_to_hardware(
     let nonce = Nonce::from(nonce_bytes);
 
     let payload = Payload {
-        msg: seed.as_slice(),
+        msg: seed.as_bytes().as_slice(),
         aad: &seal_aad(fingerprint),
     };
     let ciphertext = cipher.encrypt(&nonce, payload).expect("Encryption failure");
@@ -135,14 +136,14 @@ pub fn seal_to_hardware(
     sealed_blob[0..12].copy_from_slice(&nonce_bytes);
     sealed_blob[12..SEALED_SEED_LEN].copy_from_slice(&ciphertext);
 
-    sealed_blob
+    SealedSeed::from_bytes(sealed_blob)
 }
 
-pub fn unseal_from_hardware(
+pub fn unseal_seed(
     firmware: &mut Firmware,
-    sealed_blob: &[u8; SEALED_SEED_LEN],
+    sealed_seed: &SealedSeed,
     fingerprint: &SeedFingerprint,
-) -> [u8; 32] {
+) -> PlainSeed {
     println!("Requesting derived sealing key from AMD Secure Processor...");
 
     let mut hardware_key = derive_sealing_key(firmware);
@@ -150,6 +151,7 @@ pub fn unseal_from_hardware(
         ChaCha20Poly1305::new_from_slice(hardware_key.as_slice()).expect("Invalid key length");
     hardware_key.zeroize();
 
+    let sealed_blob = sealed_seed.as_bytes();
     let nonce_bytes: [u8; 12] = sealed_blob[0..12]
         .try_into()
         .expect("nonce length is fixed");
@@ -167,7 +169,7 @@ pub fn unseal_from_hardware(
         .try_into()
         .expect("sealed seed plaintext must be 32 bytes");
     plaintext.zeroize();
-    seed
+    PlainSeed::from_bytes(seed)
 }
 
 fn derive_sealing_key(firmware: &mut Firmware) -> [u8; 32] {

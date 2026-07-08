@@ -13,19 +13,19 @@ unseals it inside the SEV-SNP VM, and exposes a tiny local signing API.
 ## Commands
 
 ```text
-zns-keys init [--state PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys status [--state PATH]
-zns-keys attest [--state PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys verify [--state PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys serve [--state PATH] [--socket PATH]
+zns-keys init [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys status [--key-file PATH]
+zns-keys attest [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys verify [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
+zns-keys serve [--key-file PATH] [--socket PATH]
 ```
 
 Defaults:
 
 ```text
-state:  zns_keys.state
-report: zns_attestation.report
-socket: zns-keys.sock
+key file: zns_keys.key
+report:   zns_attestation.report
+socket:   zns-keys.sock
 ```
 
 ## Lifecycle
@@ -35,7 +35,7 @@ socket: zns-keys.sock
 3. It requests an AMD SEV-SNP attestation report binding:
    - `report_data[0..32] = seed fingerprint`
    - `report_data[32..64] = optional verifier challenge`
-4. It seals the seed with a SEV-SNP derived key and writes `zns_keys.state`.
+4. It seals the seed with a SEV-SNP derived key and writes `zns_keys.key`.
 5. `serve` unseals the seed and listens on a Unix socket for `zns-mint`.
 
 ## Socket Protocol

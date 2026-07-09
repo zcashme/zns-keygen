@@ -1,4 +1,5 @@
-use bech32::{Bech32, Hrp};
+mod fingerprint;
+
 use blake2b_simd::Params as Blake2bParams;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -6,18 +7,24 @@ use chacha20poly1305::{
 };
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use sev::firmware::guest::{DerivedKey, Firmware, GuestFieldSelect};
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_arch = "x86_64")]
 use std::hint::spin_loop;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-const DEFAULT_SEED_FILE: &str = "zns_seed.sealed";
-const DEFAULT_SOCKET: &str = "zns-keys.sock";
+use fingerprint::SeedFingerprint;
+
+const CAPSULE_FILE: &str = "zns_seed.capsule";
+const MANIFEST_FILE: &str = "zns_custody_manifest.toml";
+const MINT_CONFIG_FILE: &str = "zns_mint.conf";
+
+const NETWORK: &str = "mainnet";
+const ISSUER_EPOCH: u8 = 1;
+const TREASURY_ACCOUNT: u32 = 0;
+const REGISTRY_ACCOUNT: u32 = 1;
 
 const SEED_LEN: usize = 32;
 const FINGERPRINT_LEN: usize = 32;
@@ -26,12 +33,8 @@ const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
 
-const DOMAIN_TAG: &[u8; 10] = b"ZcashNames";
-const SEALED_MAGIC_LEN: usize = 10;
-const SEALED_HEADER_LEN: usize = SEALED_MAGIC_LEN + FINGERPRINT_LEN;
-const SEALED_FILE_LEN: usize = SEALED_HEADER_LEN + NONCE_LEN + CIPHERTEXT_LEN;
-const FINGERPRINT_PERSONALIZATION: &[u8; 16] = b"ZcashNames\0\0\0\0\0\0";
-const FINGERPRINT_HRP: Hrp = Hrp::parse_unchecked("zcashnames");
+const CAPSULE_MAGIC: &[u8; 8] = b"ZNSCAPS1";
+const CAPSULE_CONTEXT: &[u8] = b"ZcashNames mainnet issuer epoch 1; treasury=0; registry=1; sealing=amd-sev-snp-vmrk-instance-bound";
 
 type ZnsResult<T> = Result<T, String>;
 
@@ -43,47 +46,36 @@ fn main() {
 }
 
 fn run() -> ZnsResult<()> {
-    let seed_path = Path::new(DEFAULT_SEED_FILE);
-    let socket_path = Path::new(DEFAULT_SOCKET);
+    let capsule_path = Path::new(CAPSULE_FILE);
+    let manifest_path = Path::new(MANIFEST_FILE);
+    let mint_config_path = Path::new(MINT_CONFIG_FILE);
 
-    if !seed_path.exists() {
-        println!("No sealed seed found. Generating new custody seed...");
-        let seed = Seed::generate()?;
-        let fingerprint = seed.fingerprint()?;
-        let sealing_key = derive_sev_sealing_key()?;
-        let sealed_seed = seal_seed(&seed, &sealing_key, fingerprint)?;
-        write_new_file(seed_path, &sealed_seed.encode())?;
-        println!("Sealed seed saved to {}", seed_path.display());
-    }
+    ensure_absent(capsule_path)?;
+    ensure_absent(manifest_path)?;
+    ensure_absent(mint_config_path)?;
 
-    let sealed_seed = SealedSeed::read(seed_path)?;
-    let sealing_key = derive_sev_sealing_key()?;
-    let seed = unseal_seed(&sealed_seed, &sealing_key)?;
+    let seed = Seed::generate()?;
+    let fingerprint = seed.fingerprint();
+    let sealing_key = derive_instance_bound_sev_sealing_key()?;
+    let capsule = seal_seed(&seed, &sealing_key, fingerprint)?;
+    let capsule_bytes = postcard::to_allocvec(&capsule)
+        .map_err(|err| format!("failed to serialize capsule: {err}"))?;
+    let capsule_hash = blake2b256(&capsule_bytes);
+    let manifest = custody_manifest(fingerprint, &capsule_hash);
+    let mint_config = mint_config_toml(fingerprint);
 
-    prepare_socket_path(socket_path)?;
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|err| format!("failed to bind socket {}: {err}", socket_path.display()))?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-        format!(
-            "failed to set socket permissions {}: {err}",
-            socket_path.display()
-        )
-    })?;
+    write_new_file(capsule_path, &capsule_bytes)?;
+    write_new_file(manifest_path, manifest.as_bytes())?;
+    write_new_file(mint_config_path, mint_config.as_bytes())?;
 
-    println!("zns-keys serving");
-    println!("socket: {}", socket_path.display());
-    println!("fingerprint: {}", sealed_seed.fingerprint);
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_client(stream, sealed_seed.fingerprint, &seed) {
-                    eprintln!("client error: {err}");
-                }
-            }
-            Err(err) => eprintln!("accept error: {err}"),
-        }
-    }
+    println!("ZNS genesis capsule created");
+    println!("capsule: {}", capsule_path.display());
+    println!("manifest: {}", manifest_path.display());
+    println!("mint_config: {}", mint_config_path.display());
+    println!("seed_fingerprint: {fingerprint}");
+    println!("capsule_hash_blake2b256: {}", hex::encode(capsule_hash));
+    println!("migration: none");
+    println!("signer_socket: none");
 
     Ok(())
 }
@@ -97,26 +89,15 @@ impl Seed {
         Ok(seed)
     }
 
-    fn from_plaintext(plaintext: &mut [u8]) -> ZnsResult<Seed> {
-        if plaintext.len() != SEED_LEN {
-            return Err(format!(
-                "decrypted seed length was {}, expected {SEED_LEN}",
-                plaintext.len()
-            ));
-        }
-
-        let mut seed = Seed(Zeroizing::new([0u8; SEED_LEN]));
-        seed.0.copy_from_slice(plaintext);
-        plaintext.zeroize();
-        Ok(seed)
-    }
-
-    fn expose_for_signing<R>(&self, f: impl FnOnce(&[u8; SEED_LEN]) -> R) -> R {
+    fn expose<R>(&self, f: impl FnOnce(&[u8; SEED_LEN]) -> R) -> R {
         f(&self.0)
     }
 
-    fn fingerprint(&self) -> ZnsResult<SeedFingerprint> {
-        self.expose_for_signing(SeedFingerprint::from_seed)
+    fn fingerprint(&self) -> SeedFingerprint {
+        self.expose(|seed_bytes| {
+            SeedFingerprint::from_seed(seed_bytes)
+                .expect("32-byte seed is within ZIP 32 range")
+        })
     }
 }
 
@@ -128,112 +109,29 @@ impl SealingKey {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SeedFingerprint([u8; FINGERPRINT_LEN]);
-
-impl SeedFingerprint {
-    fn from_seed(seed: &[u8; SEED_LEN]) -> ZnsResult<SeedFingerprint> {
-        Ok(SeedFingerprint(
-            Blake2bParams::new()
-                .hash_length(FINGERPRINT_LEN)
-                .personal(FINGERPRINT_PERSONALIZATION)
-                .to_state()
-                .update(&[SEED_LEN as u8])
-                .update(seed)
-                .finalize()
-                .as_bytes()
-                .try_into()
-                .map_err(|_| "fingerprint hash length mismatch".to_string())?,
-        ))
-    }
-
-    fn from_bytes(bytes: [u8; FINGERPRINT_LEN]) -> SeedFingerprint {
-        SeedFingerprint(bytes)
-    }
-
-    fn to_bytes(self) -> [u8; FINGERPRINT_LEN] {
-        self.0
-    }
-}
-
-impl fmt::Display for SeedFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match bech32::encode::<Bech32>(FINGERPRINT_HRP, &self.0) {
-            Ok(encoded) => f.write_str(&encoded),
-            Err(_) => {
-                for byte in self.0 {
-                    write!(f, "{byte:02x}")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct SealedSeed {
-    fingerprint: SeedFingerprint,
-    nonce: [u8; NONCE_LEN],
-    ciphertext: [u8; CIPHERTEXT_LEN],
-}
-
-impl SealedSeed {
-    fn encode(&self) -> [u8; SEALED_FILE_LEN] {
-        let mut out = [0u8; SEALED_FILE_LEN];
-        out[..SEALED_HEADER_LEN].copy_from_slice(&sealed_header(self.fingerprint));
-        out[SEALED_HEADER_LEN..SEALED_HEADER_LEN + NONCE_LEN].copy_from_slice(&self.nonce);
-        out[SEALED_HEADER_LEN + NONCE_LEN..].copy_from_slice(&self.ciphertext);
-        out
-    }
-
-    fn decode(bytes: &[u8]) -> ZnsResult<SealedSeed> {
-        if bytes.len() != SEALED_FILE_LEN {
-            return Err(format!(
-                "invalid sealed seed length: expected {SEALED_FILE_LEN}, got {}",
-                bytes.len()
-            ));
-        }
-        if &bytes[0..SEALED_MAGIC_LEN] != DOMAIN_TAG {
-            return Err("invalid sealed seed magic".to_string());
-        }
-
-        Ok(SealedSeed {
-            fingerprint: SeedFingerprint::from_bytes(
-                bytes[SEALED_MAGIC_LEN..SEALED_MAGIC_LEN + FINGERPRINT_LEN]
-                    .try_into()
-                    .expect("fingerprint length fixed"),
-            ),
-            nonce: bytes[SEALED_MAGIC_LEN + FINGERPRINT_LEN
-                ..SEALED_MAGIC_LEN + FINGERPRINT_LEN + NONCE_LEN]
-                .try_into()
-                .expect("nonce length fixed"),
-            ciphertext: bytes[SEALED_MAGIC_LEN + FINGERPRINT_LEN + NONCE_LEN..SEALED_FILE_LEN]
-                .try_into()
-                .expect("ciphertext length fixed"),
-        })
-    }
-
-    fn read(path: &Path) -> ZnsResult<SealedSeed> {
-        let bytes = fs::read(path)
-            .map_err(|err| format!("failed to read sealed seed file {}: {err}", path.display()))?;
-        SealedSeed::decode(&bytes)
-    }
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct SeedCapsule {
+    magic: [u8; 8],
+    fingerprint: [u8; FINGERPRINT_LEN],
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
 }
 
 fn seal_seed(
     seed: &Seed,
     sealing_key: &SealingKey,
     fingerprint: SeedFingerprint,
-) -> ZnsResult<SealedSeed> {
+) -> ZnsResult<SeedCapsule> {
     let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
         .map_err(|_| "invalid sealing key length".to_string())?;
 
     let mut nonce = [0u8; NONCE_LEN];
     fill_entropy(&mut nonce)?;
-    let aad = seal_aad(fingerprint);
+    let aad = capsule_aad(fingerprint);
     let nonce_ref =
         <&XNonce>::try_from(nonce.as_slice()).map_err(|_| "invalid nonce length".to_string())?;
-    let ciphertext = seed.expose_for_signing(|seed_bytes| {
+
+    let ciphertext = seed.expose(|seed_bytes| {
         cipher.encrypt(
             nonce_ref,
             Payload {
@@ -244,98 +142,102 @@ fn seal_seed(
     });
     let ciphertext = ciphertext.map_err(|_| "failed to encrypt seed".to_string())?;
 
-    Ok(SealedSeed {
-        fingerprint,
-        nonce,
-        ciphertext: ciphertext
-            .as_slice()
-            .try_into()
-            .map_err(|_| "sealed seed ciphertext length mismatch".to_string())?,
+    if ciphertext.len() != CIPHERTEXT_LEN {
+        return Err(format!(
+            "capsule ciphertext length mismatch: expected {CIPHERTEXT_LEN}, got {}",
+            ciphertext.len()
+        ));
+    }
+
+    Ok(SeedCapsule {
+        magic: *CAPSULE_MAGIC,
+        fingerprint: fingerprint.to_bytes(),
+        nonce: nonce.to_vec(),
+        ciphertext,
     })
 }
 
-fn unseal_seed(sealed_seed: &SealedSeed, sealing_key: &SealingKey) -> ZnsResult<Seed> {
-    let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
-        .map_err(|_| "invalid sealing key length".to_string())?;
-    let aad = seal_aad(sealed_seed.fingerprint);
-    let nonce = <&XNonce>::try_from(sealed_seed.nonce.as_slice())
-        .map_err(|_| "invalid nonce length".to_string())?;
-
-    let mut plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: &sealed_seed.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "failed to decrypt sealed seed".to_string())?;
-
-    let seed = Seed::from_plaintext(&mut plaintext)?;
-    plaintext.zeroize();
-
-    let actual_fingerprint = seed.fingerprint()?;
-    if actual_fingerprint != sealed_seed.fingerprint {
-        return Err("decrypted seed fingerprint mismatch".to_string());
-    }
-
-    Ok(seed)
+fn capsule_aad(fingerprint: SeedFingerprint) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(CAPSULE_MAGIC.len() + FINGERPRINT_LEN + CAPSULE_CONTEXT.len());
+    aad.extend_from_slice(CAPSULE_MAGIC);
+    aad.extend_from_slice(&fingerprint.to_bytes());
+    aad.extend_from_slice(CAPSULE_CONTEXT);
+    aad
 }
 
-fn seal_aad(fingerprint: SeedFingerprint) -> [u8; SEALED_HEADER_LEN] {
-    sealed_header(fingerprint)
+#[derive(serde::Serialize)]
+struct CustodyManifest {
+    manifest_version: u8,
+    network: &'static str,
+    issuer_epoch: u8,
+    seed_fingerprint: String,
+    capsule_file: &'static str,
+    capsule_hash_blake2b256: String,
+    capsule_format: String,
+    capsule_context: String,
+    seed_length: usize,
+    treasury_account: u32,
+    registry_account: u32,
+    sealing: &'static str,
+    sealing_root_key: &'static str,
+    sealing_guest_fields: &'static str,
+    rng: &'static str,
+    migration: &'static str,
+    signer_socket: &'static str,
 }
 
-fn sealed_header(fingerprint: SeedFingerprint) -> [u8; SEALED_HEADER_LEN] {
-    let mut header = [0u8; SEALED_HEADER_LEN];
-    header[0..SEALED_MAGIC_LEN].copy_from_slice(DOMAIN_TAG);
-    header[SEALED_MAGIC_LEN..SEALED_HEADER_LEN].copy_from_slice(&fingerprint.to_bytes());
-    header
+fn custody_manifest(fingerprint: SeedFingerprint, capsule_hash: &[u8; 32]) -> String {
+    let manifest = CustodyManifest {
+        manifest_version: 1,
+        network: NETWORK,
+        issuer_epoch: ISSUER_EPOCH,
+        seed_fingerprint: fingerprint.to_string(),
+        capsule_file: CAPSULE_FILE,
+        capsule_hash_blake2b256: hex::encode(capsule_hash),
+        capsule_format: String::from_utf8_lossy(CAPSULE_MAGIC).into_owned(),
+        capsule_context: String::from_utf8_lossy(CAPSULE_CONTEXT).into_owned(),
+        seed_length: SEED_LEN,
+        treasury_account: TREASURY_ACCOUNT,
+        registry_account: REGISTRY_ACCOUNT,
+        sealing: "amd-sev-snp-vmrk-instance-bound",
+        sealing_root_key: "vmrk",
+        sealing_guest_fields: "guest_policy,image_id,family_id,measurement",
+        rng: "rdseed",
+        migration: "none",
+        signer_socket: "none",
+    };
+    toml::to_string(&manifest).unwrap_or_else(|err| {
+        panic!("failed to serialize manifest: {err}")
+    })
 }
 
-fn handle_client(stream: UnixStream, fingerprint: SeedFingerprint, seed: &Seed) -> ZnsResult<()> {
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|err| format!("failed to clone client stream: {err}"))?,
-    );
-    let mut writer = stream;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|err| format!("failed to read request: {err}"))?;
-        if n == 0 {
-            return Ok(());
-        }
-
-        let response = handle_request(line.trim_end(), fingerprint, seed);
-        writer
-            .write_all(response.as_bytes())
-            .and_then(|_| writer.write_all(b"\n"))
-            .map_err(|err| format!("failed to write response: {err}"))?;
-    }
+#[derive(serde::Serialize)]
+struct MintConfig {
+    network: &'static str,
+    issuer_epoch: u8,
+    expected_seed_fingerprint: String,
 }
 
-fn handle_request(request: &str, fingerprint: SeedFingerprint, seed: &Seed) -> String {
-    if request == "status" {
-        return format!("OK fingerprint {}", fingerprint);
-    }
-
-    if let Some(rest) = request.strip_prefix("sign ") {
-        let Ok(message) = hex::decode(rest.trim()) else {
-            return "ERR sign payload must be hex".to_string();
-        };
-        return sign_placeholder(seed, &message);
-    }
-
-    "ERR unknown command; expected status or sign <hex>".to_string()
+fn mint_config_toml(fingerprint: SeedFingerprint) -> String {
+    let config = MintConfig {
+        network: NETWORK,
+        issuer_epoch: ISSUER_EPOCH,
+        expected_seed_fingerprint: fingerprint.to_string(),
+    };
+    toml::to_string(&config).unwrap_or_else(|err| {
+        panic!("failed to serialize mint config: {err}")
+    })
 }
 
-fn sign_placeholder(_seed: &Seed, _message: &[u8]) -> String {
-    "ERR signing is not implemented in v0".to_string()
+fn blake2b256(bytes: &[u8]) -> [u8; 32] {
+    let digest = Blake2bParams::new()
+        .hash_length(32)
+        .to_state()
+        .update(bytes)
+        .finalize();
+    digest.as_bytes()[..32]
+        .try_into()
+        .expect("BLAKE2b output length is fixed")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -375,20 +277,23 @@ fn fill_entropy(dest: &mut [u8]) -> ZnsResult<()> {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn fill_entropy(_dest: &mut [u8]) -> ZnsResult<()> {
-    Err("zns-keys v0 requires x86_64 RDSEED entropy".to_string())
+    Err("zns-keygen requires x86_64 RDSEED entropy".to_string())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn derive_sev_sealing_key() -> ZnsResult<SealingKey> {
+fn derive_instance_bound_sev_sealing_key() -> ZnsResult<SealingKey> {
     let mut firmware =
         Firmware::open().map_err(|err| format!("failed to open /dev/sev-guest: {err}"))?;
     let mut guest_fields = GuestFieldSelect::default();
+    guest_fields.set_guest_policy(true);
+    guest_fields.set_image_id(true);
+    guest_fields.set_family_id(true);
     guest_fields.set_measurement(true);
 
-    let request = DerivedKey::new(false, guest_fields, 0, 0, 0, None);
-    let mut key = firmware
-        .get_derived_key(None, request)
-        .map_err(|err| format!("failed to derive SEV-SNP sealing key: {err}"))?;
+    let request = DerivedKey::new(true, guest_fields, 0, 0, 0, None);
+    let mut key = firmware.get_derived_key(None, request).map_err(|err| {
+        format!("failed to derive instance-bound SEV-SNP VMRK sealing key: {err}")
+    })?;
 
     let sealing_key = SealingKey(Zeroizing::new(key));
     key.zeroize();
@@ -396,8 +301,19 @@ fn derive_sev_sealing_key() -> ZnsResult<SealingKey> {
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-fn derive_sev_sealing_key() -> ZnsResult<SealingKey> {
-    Err("SEV-SNP sealing requires Linux x86_64 with /dev/sev-guest".to_string())
+fn derive_instance_bound_sev_sealing_key() -> ZnsResult<SealingKey> {
+    Err("SEV-SNP VMRK sealing requires Linux x86_64 with /dev/sev-guest".to_string())
+}
+
+fn ensure_absent(path: &Path) -> ZnsResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "{} already exists; refusing to create another genesis capsule",
+            path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to inspect {}: {err}", path.display())),
+    }
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> ZnsResult<()> {
@@ -432,25 +348,68 @@ fn sync_parent(path: &Path) -> ZnsResult<()> {
         })
 }
 
-fn prepare_socket_path(path: &Path) -> ZnsResult<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_socket() {
-                fs::remove_file(path).map_err(|err| {
-                    format!("failed to remove stale socket {}: {err}", path.display())
-                })?;
-                Ok(())
-            } else {
-                Err(format!(
-                    "socket path already exists and is not a socket: {}",
-                    path.display()
-                ))
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!(
-            "failed to inspect socket path {}: {err}",
-            path.display()
-        )),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_seed_matches_zip32_reference_vector() {
+        let seed_bytes: [u8; SEED_LEN] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let expected: [u8; 32] = [
+            0xde, 0xff, 0x60, 0x4c, 0x24, 0x67, 0x10, 0xf7, 0x17, 0x6d, 0xea,
+            0xd0, 0x2a, 0xa7, 0x46, 0xf2, 0xfd, 0x8d, 0x53, 0x89, 0xf7, 0x07,
+            0x25, 0x56, 0xdc, 0xb5, 0x55, 0xfd, 0xbe, 0x5e, 0x3a, 0xe3,
+        ];
+        let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
+        assert_eq!(fp.to_bytes(), expected);
+        assert_eq!(
+            fp.to_string(),
+            "zip32seedfp1mmlkqnpyvug0w9mdatgz4f6x7t7c65uf7urj24kuk42lm0j78t3sne2h0z"
+        );
+    }
+
+    #[test]
+    fn capsule_serializes_with_postcard() {
+        let capsule = SeedCapsule {
+            magic: *CAPSULE_MAGIC,
+            fingerprint: [0xAA; FINGERPRINT_LEN],
+            nonce: vec![0xBB; NONCE_LEN],
+            ciphertext: vec![0xCC; CIPHERTEXT_LEN],
+        };
+        let bytes = postcard::to_allocvec(&capsule).unwrap();
+        let decoded: SeedCapsule = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.magic, *CAPSULE_MAGIC);
+        assert_eq!(decoded.fingerprint, [0xAA; FINGERPRINT_LEN]);
+        assert_eq!(decoded.nonce, vec![0xBB; NONCE_LEN]);
+        assert_eq!(decoded.ciphertext, vec![0xCC; CIPHERTEXT_LEN]);
+    }
+
+    #[test]
+    fn manifest_serializes_to_toml() {
+        let seed_bytes: [u8; SEED_LEN] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
+        let manifest = custody_manifest(fp, &[0u8; 32]);
+        assert!(manifest.contains("seed_fingerprint"));
+        assert!(manifest.contains("mainnet"));
+    }
+
+    #[test]
+    fn mint_config_contains_fingerprint() {
+        let seed_bytes: [u8; SEED_LEN] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
+        let config = mint_config_toml(fp);
+        assert!(config.contains("expected_seed_fingerprint"));
     }
 }

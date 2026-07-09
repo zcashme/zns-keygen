@@ -1,16 +1,19 @@
 [package]
-name = "zns-keys"
+name = "zns-keygen"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "zns-keys"
+name = "zns-keygen"
 path = "src/main.rs"
 
 [dependencies]
-rand_core = "0.10.1"
-bech32 = "0.12.0"
 blake2b_simd = "1.0.4"
 sev = { version = "8.0.0", default-features = false, features = ["snp"] }
-chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+hex = "0.4.3"
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 zeroize = "1.9.0"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+toml = "0.8"

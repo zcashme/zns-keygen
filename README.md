@@ -10,33 +10,20 @@ zns-mint -> zns-keys -> signature
 `zns-mint` never loads the seed. `zns-keys` creates it, seals it for restart,
 unseals it inside the SEV-SNP VM, and exposes a tiny local signing API.
 
-## Commands
+## Operation
 
-```text
-zns-keys init [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys status [--key-file PATH]
-zns-keys attest [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys verify [--key-file PATH] [--report PATH] [--challenge-hex HEX64]
-zns-keys serve [--key-file PATH] [--socket PATH]
-```
+When executed, `zns-keys` will automatically:
+
+1. Check for an existing `zns_seed.sealed` file.
+2. If none exists, it generates a new 32-byte seed using `RDSEED`, computes the ZIP-32 seed fingerprint, seals it with a SEV-SNP derived key, and writes `zns_seed.sealed`.
+3. Unseal the seed and listen on a Unix socket for `zns-mint`.
 
 Defaults:
 
 ```text
-key file: zns_keys.key
-report:   zns_attestation.report
-socket:   zns-keys.sock
+seed file: zns_seed.sealed
+socket:    zns-keys.sock
 ```
-
-## Lifecycle
-
-1. `init` generates a 32-byte seed using `RDSEED`.
-2. It computes the ZIP-32 seed fingerprint.
-3. It requests an AMD SEV-SNP attestation report binding:
-   - `report_data[0..32] = seed fingerprint`
-   - `report_data[32..64] = optional verifier challenge`
-4. It seals the seed with a SEV-SNP derived key and writes `zns_keys.key`.
-5. `serve` unseals the seed and listens on a Unix socket for `zns-mint`.
 
 ## Socket Protocol
 
@@ -64,10 +51,9 @@ is added.
 `migrate-export` and `migrate-import` are intentionally reserved for v2. The
 intended design is signer-to-signer migration:
 
-1. New `zns-keys` instance creates an attested migration public key.
-2. Old `zns-keys` verifies the new attestation.
-3. Old `zns-keys` encrypts the seed to the new instance.
-4. New `zns-keys` decrypts inside its TEE and seals locally.
+1. New `zns-keys` instance creates a migration public key.
+2. Old `zns-keys` encrypts the seed to the new instance.
+3. New `zns-keys` decrypts inside its TEE and seals locally.
 
 No plaintext seed should pass through the operator.
 

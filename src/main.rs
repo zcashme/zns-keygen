@@ -30,6 +30,7 @@ use chacha20poly1305::{
 // (/dev/sev-guest) for two things: deriving a VM-bound key, and requesting
 // an attestation report signed by the AMD PSP.
 use sev::firmware::guest::{AttestationReport, DerivedKey, Firmware, GuestFieldSelect};
+use sev::parser::ByteParser; // brings from_bytes into scope
 // Standard library I/O for reading/writing files.
 use std::fs::{self, File, OpenOptions};
 use std::hint::spin_loop;
@@ -602,7 +603,7 @@ fn derive_instance_bound_sev_sealing_key() -> SealingKey {
     let request = DerivedKey::new(true, guest_fields, 0, 0, 0, None);
 
     let mut key = firmware
-        .get_derived_key(None, request)
+        .get_derived_key(Some(1), request)
         .expect("failed to derive SEV-SNP VMRK sealing key");
 
     // Wrap in Zeroizing and wipe the raw key bytes.

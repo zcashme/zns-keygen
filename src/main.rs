@@ -14,10 +14,11 @@
 //! 7. Exits. It never runs again.
 //!
 
+mod attestation;
 mod fingerprint;
 
 // ── Dependencies ───────────────────────────────────────────────────────
-// BLAKE2b is used for hashing (seed fingerprint, capsule hash, report_data).
+// BLAKE2b is used for hashing (seed fingerprint, capsule hash).
 use blake2b_simd::Params as Blake2bParams;
 // XChaCha20Poly1305 is the AEAD cipher used to encrypt the seed into the
 // capsule. It provides both confidentiality (encryption) and integrity
@@ -27,10 +28,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 // The `sev` crate provides access to the AMD SEV-SNP firmware interface
-// (/dev/sev-guest) for two things: deriving a VM-bound key, and requesting
-// an attestation report signed by the AMD PSP.
-use sev::firmware::guest::{AttestationReport, DerivedKey, Firmware, GuestFieldSelect};
-use sev::parser::ByteParser; // brings from_bytes into scope
+// (/dev/sev-guest) for deriving a VM-bound sealing key. Attestation report
+// requesting and parsing live in the `attestation` module.
+use sev::firmware::guest::{DerivedKey, Firmware, GuestFieldSelect};
 // Standard library I/O for reading/writing files.
 use std::fs::{self, File, OpenOptions};
 use std::hint::spin_loop;
@@ -150,16 +150,14 @@ fn main() {
     // The report_data binds the attestation to this specific seed
     // fingerprint and capsule hash, so a verifier can confirm the
     // report was produced for THIS capsule — not replayed.
-    let report_data = attestation_report_data(fingerprint, &capsule_hash);
-    let report_bytes = request_attestation_report(&report_data);
+    // The attestation module self-verifies the report_data before returning.
+    let report_data = attestation::report_data(&fingerprint, &capsule_hash);
+    let attestation = attestation::request(&report_data);
 
-    // Parse the attestation report to extract the measurement (the hash
-    // of the VM's initial code). This goes into the manifest so verifiers
-    // know what measurement to expect without parsing the binary report.
-    let report = AttestationReport::from_bytes(&report_bytes).unwrap();
+    // Hash the attestation artifacts for the manifest.
     let report_data_hash = blake2b256(&report_data);
-    let attestation_hash = blake2b256(&report_bytes);
-    let measurement = hex::encode(report.measurement);
+    let attestation_hash = blake2b256(&attestation.report_bytes);
+    let measurement = hex::encode(attestation.measurement);
 
     // Step 6: Build the manifest (public TOML metadata) and mint config.
     let manifest = custody_manifest(
@@ -168,14 +166,19 @@ fn main() {
         &report_data_hash,
         &attestation_hash,
         &measurement,
+        attestation.guest_policy,
+        &attestation.image_id,
+        &attestation.family_id,
     );
     let mint_config = mint_config_toml(fingerprint);
 
-    // Step 7: Write all four files to disk (with sync, mode 0o600).
-    write_new_file(capsule_path, &capsule_bytes);
-    write_new_file(manifest_path, manifest.as_bytes());
-    write_new_file(mint_config_path, mint_config.as_bytes());
-    write_new_file(attestation_path, &report_bytes);
+    // Step 7: Write all four files to disk.
+    // Capsule and mint config are owner-only (0o600); manifest and attestation
+    // are public (0o644) so third-party verification tools can read them.
+    write_secret_file(capsule_path, &capsule_bytes);
+    write_public_file(manifest_path, manifest.as_bytes());
+    write_secret_file(mint_config_path, mint_config.as_bytes());
+    write_public_file(attestation_path, &attestation.report_bytes);
 
     // Print a summary of what was produced. This output is also useful
     // for logging the ceremony — record it somewhere durable.
@@ -191,6 +194,9 @@ fn main() {
         hex::encode(attestation_hash)
     );
     println!("measurement: {measurement}");
+    println!("guest_policy: 0x{:016x}", attestation.guest_policy);
+    println!("image_id: {}", hex::encode(attestation.image_id));
+    println!("family_id: {}", hex::encode(attestation.family_id));
     println!(
         "report_data_hash_blake2b256: {}",
         hex::encode(report_data_hash)
@@ -212,10 +218,19 @@ struct Seed(Zeroizing<[u8; SEED_LEN]>);
 
 impl Seed {
     /// Generate a new seed from hardware entropy (RDSEED).
-    /// Panics if RDSEED is unavailable or fails after 10,000 retries.
+    /// Panics if RDSEED is unavailable or fails after 10,000 retries,
+    /// or if the output is degenerate (all zeros / all 0xFF) which
+    /// indicates a broken entropy source.
     fn generate() -> Seed {
         let mut seed = Seed(Zeroizing::new([0u8; SEED_LEN]));
         fill_entropy(&mut seed.0[..]);
+
+        // Reject degenerate seeds that indicate a broken entropy source.
+        let all_zero = seed.0.iter().all(|&b| b == 0);
+        let all_ff = seed.0.iter().all(|&b| b == 0xff);
+        assert!(!all_zero, "RDSEED returned all zeros — entropy source may be broken");
+        assert!(!all_ff, "RDSEED returned all 0xFF — entropy source may be broken");
+
         seed
     }
 
@@ -371,6 +386,9 @@ struct CustodyManifest {
     sealing: &'static str,               // "amd-sev-snp-vmrk-instance-bound"
     sealing_root_key: &'static str,      // "vmrk" (which SEV-SNP root key was used)
     sealing_guest_fields: &'static str,  // Which guest fields were bound into the key
+    guest_policy: String,                // Actual guest policy value from attestation (hex)
+    image_id: String,                   // Actual image ID from attestation (hex)
+    family_id: String,                  // Actual family ID from attestation (hex)
     rng: &'static str,                   // "rdseed"
     attestation_file: &'static str,      // "zns_attestation.bin"
     attestation_hash_blake2b256: String, // Hash of the attestation report
@@ -388,6 +406,9 @@ fn custody_manifest(
     report_data_hash: &[u8; 32],
     attestation_hash: &[u8; 32],
     measurement: &str,
+    guest_policy: u64,
+    image_id: &[u8; 16],
+    family_id: &[u8; 16],
 ) -> String {
     let manifest = CustodyManifest {
         manifest_version: 1,
@@ -402,6 +423,9 @@ fn custody_manifest(
         sealing: "amd-sev-snp-vmrk-instance-bound",
         sealing_root_key: "vmrk",
         sealing_guest_fields: "guest_policy,image_id,family_id,measurement",
+        guest_policy: format!("0x{guest_policy:016x}"),
+        image_id: hex::encode(image_id),
+        family_id: hex::encode(family_id),
         rng: "rdseed",
         attestation_file: ATTESTATION_FILE,
         attestation_hash_blake2b256: hex::encode(attestation_hash),
@@ -449,71 +473,6 @@ fn blake2b256(bytes: &[u8]) -> [u8; 32] {
         .expect("BLAKE2b output length is fixed")
 }
 
-// ── Attestation report_data ───────────────────────────────────────────
-
-/// Compute the 64-byte report_data for the SEV-SNP attestation report.
-///
-/// report_data = BLAKE2b-512(seed_fingerprint || capsule_hash)
-///
-/// The AMD PSP signs the attestation report, and the report includes this
-/// report_data. This cryptographically binds the attestation to this
-/// specific capsule: a verifier can recompute BLAKE2b-512 from the
-/// manifest's seed_fingerprint and capsule_hash, and check it matches
-/// the report_data inside the attestation report.
-///
-/// Without this binding, an attacker could take a valid attestation from
-/// one ceremony and claim it was for a different capsule.
-fn attestation_report_data(
-    fingerprint: SeedFingerprint,
-    capsule_hash: &[u8; 32],
-) -> [u8; REPORT_DATA_LEN] {
-    let mut input = Vec::with_capacity(FINGERPRINT_LEN + 32);
-    input.extend_from_slice(&fingerprint.to_bytes());
-    input.extend_from_slice(capsule_hash);
-
-    let digest = Blake2bParams::new()
-        .hash_length(REPORT_DATA_LEN)
-        .to_state()
-        .update(&input)
-        .finalize();
-
-    let mut report_data = [0u8; REPORT_DATA_LEN];
-    report_data.copy_from_slice(digest.as_bytes());
-    report_data
-}
-
-// ── SEV-SNP attestation report request ────────────────────────────────
-
-/// Request a SEV-SNP attestation report from the AMD PSP.
-///
-/// The PSP (Platform Security Processor) is a separate secure processor
-/// on the AMD chip. It signs the attestation report with the VCEK
-/// (Versioned Chip Endorsement Key), an ECDSA-P256 key whose certificate
-/// chains to AMD's root CA.
-///
-/// The report contains:
-/// - The VM's measurement (hash of the guest's initial code — proves
-///   what software was running)
-/// - The guest policy, image_id, family_id (launch parameters)
-/// - The report_data we supplied (our binding to the capsule)
-/// - The chip_id and reported_tcb (needed to fetch the VCEK cert from
-///   AMD's KDS for verification)
-/// - The ECDSA-P256 signature over all of the above
-///
-/// To verify the report, a third party:
-/// 1. Parses the report to extract chip_id and reported_tcb
-/// 2. Fetches the VCEK cert from https://kdsintf.amd.com/vcek/v1/...
-/// 3. Verifies the ARK → ASK → VCEK certificate chain
-/// 4. Verifies the ECDSA-P256 signature on the report
-/// 5. Checks the measurement matches the expected zns-keygen binary
-/// 6. Checks the report_data matches BLAKE2b-512(fingerprint || capsule_hash)
-fn request_attestation_report(report_data: &[u8; REPORT_DATA_LEN]) -> Vec<u8> {
-    let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
-    firmware
-        .get_report(None, Some(*report_data), None)
-        .expect("failed to request SEV-SNP attestation report")
-}
-
 // ── Hardware entropy (RDSEED) ────────────────────────────────────────
 
 /// Fill a buffer with random bytes using the x86_64 RDSEED instruction.
@@ -539,11 +498,16 @@ fn fill_entropy(dest: &mut [u8]) {
 
         // Try RDSEED up to 10,000 times. The instruction returns 1 on
         // success (value is filled) or 0 on failure (try again).
-        for _ in 0..10_000 {
+        for attempt in 0..10_000 {
             unsafe {
                 if core::arch::x86_64::_rdseed64_step(&mut value) == 1 {
                     break;
                 }
+            }
+            // Yield to the scheduler every 1000 retries so we don't
+            // burn CPU in a tight spin on a busy or shared VM.
+            if attempt % 1000 == 999 {
+                std::thread::yield_now();
             }
             spin_loop();
         }
@@ -629,26 +593,34 @@ fn ensure_absent(path: &Path) {
     }
 }
 
-/// Write bytes to a new file with mode 0600 (owner read/write only),
-/// then sync to disk. Panics if the file can't be created or written.
-///
-/// The sync is important: without it, the file might only be in the
-/// OS page cache, not actually on disk. A power failure after write
-/// but before sync could lose the data. We also sync the parent
-/// directory so the file's directory entry is durable.
-fn write_new_file(path: &Path, bytes: &[u8]) {
+/// Write bytes to a new secret file with mode 0600 (owner read/write only),
+/// then sync to disk. Used for the capsule and mint config.
+fn write_secret_file(path: &Path, bytes: &[u8]) {
     let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true) // Fail if the file already exists
-        .mode(0o600) // Owner read/write only
+        .create_new(true)
+        .mode(0o600)
         .open(path)
-        .expect("failed to create file");
+        .expect("failed to create secret file");
 
     file.write_all(bytes).expect("failed to write file");
     file.sync_all().expect("failed to sync file");
+    sync_parent(path);
+}
 
-    // Also sync the parent directory so the file's metadata
-    // (name, permissions) is persisted to disk.
+/// Write bytes to a new public file with mode 0644 (world-readable),
+/// then sync to disk. Used for the manifest and attestation report,
+/// which are public documents meant for third-party verification.
+fn write_public_file(path: &Path, bytes: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .expect("failed to create public file");
+
+    file.write_all(bytes).expect("failed to write file");
+    file.sync_all().expect("failed to sync file");
     sync_parent(path);
 }
 
@@ -736,11 +708,17 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             "0000000000000000000000000000000000000000000000000000000000000000",
+            0x30000, // example guest policy
+            &[0u8; 16],
+            &[0u8; 16],
         );
         assert!(manifest.contains("seed_fingerprint"));
         assert!(manifest.contains("mainnet"));
         assert!(manifest.contains("attestation_file"));
         assert!(manifest.contains("measurement"));
+        assert!(manifest.contains("guest_policy"));
+        assert!(manifest.contains("image_id"));
+        assert!(manifest.contains("family_id"));
     }
 
     /// Verify that the mint config includes the expected seed fingerprint.

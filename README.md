@@ -32,8 +32,8 @@ When executed, `zns-keygen`:
    Bech32m with HRP `zip32seedfp`.
 4. Derives an instance-bound SEV-SNP VMRK sealing key using guest policy, image
    ID, family ID, and measurement.
-5. Encrypts the seed with `XChaCha20Poly1305`, binding the seed fingerprint and
-   a context string into the AAD (Additional Authenticated Data).
+5. Encrypts the seed with `XChaCha20Poly1305`, binding the capsule magic
+   and seed fingerprint into the AAD (Additional Authenticated Data).
 6. Writes `zns_seed.capsule` (postcard-serialized struct: magic + fingerprint + nonce + ciphertext+tag).
 7. Writes `zns_custody_manifest.toml` (public metadata, TOML format).
 8. Writes `zns_mint.conf` (mint config with expected seed fingerprint, TOML format).
@@ -68,7 +68,6 @@ also published in the manifest.
 
 ```toml
 network = "mainnet"
-issuer_epoch = 1
 expected_seed_fingerprint = "zip32seedfp..."
 ```
 
@@ -78,19 +77,21 @@ of the measured launch state.
 
 ## AAD and context binding
 
-The encryption binds the following into the AAD so that decrypting the capsule
-in the wrong context fails:
+The encryption binds the following into the AAD so that tampering with the
+capsule or swapping ciphertext between capsules is detected:
 
-- The capsule header (magic + fingerprint).
-- A context string:
-  `ZcashNames mainnet issuer epoch 1; treasury=0; registry=1; sealing=amd-sev-snp-vmrk-instance-bound`
+- The capsule magic (`ZNSCAPS1`).
+- The seed fingerprint.
 
-This prevents ciphertext reuse across networks, epochs, or account allocations.
+Network and sealing-policy binding are enforced by the SEV-SNP key derivation
+itself: different VM launches get different VMRK-derived sealing keys, so a
+capsule sealed on one VM cannot be decrypted on another.
 
 ## Custody Manifest
 
 The manifest is public. It records the seed fingerprint, capsule hash, account
-allocation, capsule format, and sealing policy. It never contains the seed.
+allocation, capsule format, sealing policy, and attestation metadata. It never
+contains the seed.
 
 The current account allocation is:
 
@@ -99,13 +100,36 @@ treasury_account: 0
 registry_account: 1
 ```
 
+The manifest also includes the actual SEV-SNP launch parameters extracted from
+the attestation report:
+
+- `guest_policy` — the guest policy value (hex)
+- `image_id` — the image ID set at launch (hex)
+- `family_id` — the family ID set at launch (hex)
+- `measurement` — the VM launch measurement / code hash (hex)
+
+These let a verifier reproduce the sealing key derivation parameters without
+parsing the raw attestation report.
+
+## Attestation
+
+`zns-keygen` requests a SEV-SNP attestation report from the AMD PSP and writes
+it to `zns_attestation.bin`. The report is self-verified before writing: the
+`report_data` field inside the report is checked against
+`BLAKE2b-512(seed_fingerprint || capsule_hash)` to ensure the PSP embedded
+the correct binding.
+
+The attestation report and custody manifest are written with mode `0644`
+(world-readable) so third-party verification tools can read them without
+root. The capsule and mint config are written with mode `0600` (owner only).
+
 ## Entropy
 
 Seed material and the encryption nonce are both generated using the x86_64
 `RDSEED` CPU instruction with a bounded spin loop (up to 10,000 retries per
-64-bit word). `RDSEED` draws directly from the CPU's hardware entropy source.
-
-On non-x86_64 or non-Linux targets, `zns-keygen` refuses to run.
+64-bit word, yielding to the scheduler every 1,000 retries). `RDSEED` draws
+directly from the CPU's hardware entropy source. Degenerate outputs (all
+zeros or all 0xFF) are rejected.
 
 ## Security Boundary
 
@@ -117,8 +141,9 @@ On non-x86_64 or non-Linux targets, `zns-keygen` refuses to run.
   decrypt the capsule.
 - **Capsule tampering.** The Poly1305 authentication tag fails decryption if
   the ciphertext, nonce, or AAD are modified.
-- **Ciphertext reuse across contexts.** The AAD binds network, epoch, and
-  account allocation, so a capsule cannot be replayed into a different context.
+- **Ciphertext reuse across contexts.** The AAD binds the capsule magic and
+  seed fingerprint, so a capsule cannot be replayed with different ciphertext.
+  Network binding is enforced by the SEV-SNP VMRK, which is unique per VM launch.
 - **Accidental re-run.** `zns-keygen` refuses to overwrite an existing capsule
   or manifest.
 

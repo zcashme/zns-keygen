@@ -53,7 +53,7 @@ The capsule is a bincode-serialized `SeedCapsule` struct containing:
 
 | Field        | Length | Description                                  |
 |--------------|--------|----------------------------------------------|
-| magic        | 8      | `ZNSCAPS1`                                   |
+| magic        | 8      | `ZNSKEY01`                                  |
 | fingerprint  | 32     | ZIP-32 seed fingerprint (plaintext, for quick identification) |
 | nonce        | 24     | XChaCha20Poly1305 nonce (random, stored in plaintext) |
 | ciphertext   | 48     | 32-byte seed encrypted + 16-byte Poly1305 auth tag |
@@ -80,7 +80,7 @@ of the measured launch state.
 The encryption binds the following into the AAD so that tampering with the
 capsule or swapping ciphertext between capsules is detected:
 
-- The capsule magic (`ZNSCAPS1`).
+- The capsule magic (`ZNSKEY01`).
 - The seed fingerprint.
 
 Network and sealing-policy binding are enforced by the SEV-SNP key derivation

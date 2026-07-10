@@ -76,8 +76,8 @@ const TAG_LEN: usize = 16; // Poly1305 authentication tag
 const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN; // ciphertext = plaintext + tag
 
 // The capsule magic identifies the file format. If the first 8 bytes of a
-// file aren't "ZNSCAPS1", it's not a ZNS capsule.
-const CAPSULE_MAGIC: &[u8; 8] = b"ZNSCAPS1";
+// file aren't "ZNS_SEED", it's not a ZNS capsule.
+const CAPSULE_MAGIC: [u8; 8] = *b"ZNS_SEED";
 
 // Compile-time checks: if any of these sizes are wrong, the build fails.
 // This catches mistakes before the tool ever runs.
@@ -339,7 +339,7 @@ fn seal_seed(seed: &Seed, sealing_key: &SealingKey, fingerprint: SeedFingerprint
     );
 
     SeedCapsule {
-        magic: *CAPSULE_MAGIC,
+        magic: CAPSULE_MAGIC,
         fingerprint: fingerprint.to_bytes(),
         nonce: nonce.to_vec(),
         ciphertext,
@@ -359,7 +359,7 @@ fn seal_seed(seed: &Seed, sealing_key: &SealingKey, fingerprint: SeedFingerprint
 /// would be a redundant label, not an enforcement.
 fn capsule_aad(fingerprint: SeedFingerprint) -> Vec<u8> {
     let mut aad = Vec::with_capacity(CAPSULE_MAGIC.len() + FINGERPRINT_LEN);
-    aad.extend_from_slice(CAPSULE_MAGIC);
+    aad.extend_from_slice(&CAPSULE_MAGIC);
     aad.extend_from_slice(&fingerprint.to_bytes());
     aad
 }
@@ -379,7 +379,7 @@ struct CustodyManifest {
     seed_fingerprint: String,            // Bech32m ZIP-32 fingerprint
     capsule_file: &'static str,          // "zns_seed.capsule"
     capsule_hash_blake2b256: String,     // Hash of the capsule file
-    capsule_format: String,              // "ZNSCAPS1"
+    capsule_format: String,              // "ZNS_SEED"
     seed_length: usize,                  // 32 bytes
     treasury_account: u32,               // ZIP-32 account 0
     registry_account: u32,               // ZIP-32 account 1
@@ -416,7 +416,7 @@ fn custody_manifest(
         seed_fingerprint: fingerprint.to_string(),
         capsule_file: CAPSULE_FILE,
         capsule_hash_blake2b256: hex::encode(capsule_hash),
-        capsule_format: String::from_utf8_lossy(CAPSULE_MAGIC).into_owned(),
+        capsule_format: String::from_utf8(CAPSULE_MAGIC.to_vec()).unwrap_or_else(|_| "unknown".into()),
         seed_length: SEED_LEN,
         treasury_account: TREASURY_ACCOUNT,
         registry_account: REGISTRY_ACCOUNT,
@@ -678,14 +678,14 @@ mod tests {
     #[test]
     fn capsule_serializes_with_postcard() {
         let capsule = SeedCapsule {
-            magic: *CAPSULE_MAGIC,
+            magic: CAPSULE_MAGIC,
             fingerprint: [0xAA; FINGERPRINT_LEN],
             nonce: vec![0xBB; NONCE_LEN],
             ciphertext: vec![0xCC; CIPHERTEXT_LEN],
         };
         let bytes = postcard::to_allocvec(&capsule).unwrap();
         let decoded: SeedCapsule = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.magic, *CAPSULE_MAGIC);
+        assert_eq!(decoded.magic, CAPSULE_MAGIC);
         assert_eq!(decoded.fingerprint, [0xAA; FINGERPRINT_LEN]);
         assert_eq!(decoded.nonce, vec![0xBB; NONCE_LEN]);
         assert_eq!(decoded.ciphertext, vec![0xCC; CIPHERTEXT_LEN]);

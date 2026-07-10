@@ -1,14 +1,9 @@
-//! zns-keygen — one-shot genesis custody tool for ZNS.
-//!
-//! This tool runs exactly once, inside an AMD SEV-SNP guest VM, and does
-//! the following:
+//! zns-keygen — signing-key genesis tool for Zcash Name Service
 //!
 //! 1. Generates a random 32-byte seed using the CPU's RDSEED instruction
-//!    (hardware entropy source — not a software RNG).
 //! 2. Computes a ZIP-32 seed fingerprint (BLAKE2b-256) so the seed can be
 //!    identified later without revealing it.
-//! 3. Derives a sealing key from the AMD SEV-SNP hardware (the VMRK — a
-//!    per-VM key that only this specific VM instance can produce).
+//! 3. Derives a sealing key from the AMD SEV-SNP hardware
 //! 4. Encrypts the seed with XChaCha20Poly1305 using that sealing key,
 //!    producing a "capsule" that can only be decrypted by this VM.
 //! 5. Requests an attestation report from the AMD PSP (Platform Security
@@ -18,13 +13,6 @@
 //!    config, and the attestation report.
 //! 7. Exits. It never runs again.
 //!
-//! The capsule and attestation can be published publicly. Only this VM
-//! (or one with the same VMRK) can decrypt the capsule. Anyone can verify
-//! the attestation report against AMD's certificate chain.
-//!
-//! If anything goes wrong at any step, the program panics. There is no
-//! error recovery — this is a ceremony tool, and partial output is worse
-//! than no output.
 
 mod fingerprint;
 
@@ -79,32 +67,32 @@ const REGISTRY_ACCOUNT: u32 = 1;
 
 // These are the sizes of the cryptographic materials. They are checked at
 // compile time by the const asserts below.
-const SEED_LEN: usize = 32;        // ZIP-32 requires 32–252 bytes
-const FINGERPRINT_LEN: usize = 32;  // BLAKE2b-256 output
-const SEALING_KEY_LEN: usize = 32;  // XChaCha20Poly1305 key length
-const NONCE_LEN: usize = 24;        // XChaCha20 uses an extended 24-byte nonce
-const TAG_LEN: usize = 16;         // Poly1305 authentication tag
-const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;  // ciphertext = plaintext + tag
+const SEED_LEN: usize = 32; // ZIP-32 requires 32–252 bytes
+const FINGERPRINT_LEN: usize = 32; // BLAKE2b-256 output
+const SEALING_KEY_LEN: usize = 32; // XChaCha20Poly1305 key length
+const NONCE_LEN: usize = 24; // XChaCha20 uses an extended 24-byte nonce
+const TAG_LEN: usize = 16; // Poly1305 authentication tag
+const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN; // ciphertext = plaintext + tag
 
 // The capsule magic identifies the file format. If the first 8 bytes of a
 // file aren't "ZNSCAPS1", it's not a ZNS capsule.
 const CAPSULE_MAGIC: &[u8; 8] = b"ZNSCAPS1";
 
-// This context string is bound into the AEAD's additional authenticated
-// data (AAD). It prevents a capsule from being used in the wrong context
-// (e.g., testnet capsule on mainnet, or a different account allocation).
-// Changing any byte of this string makes all existing capsules undecryptable.
-const CAPSULE_CONTEXT: &[u8] = b"ZcashNames mainnet; treasury=0; registry=1; sealing=amd-sev-snp-vmrk-instance-bound";
-
 // Compile-time checks: if any of these sizes are wrong, the build fails.
 // This catches mistakes before the tool ever runs.
 const _: () = assert!(SEED_LEN >= 32, "SEED_LEN must be within ZIP 32 range");
 const _: () = assert!(SEED_LEN <= 252, "SEED_LEN must be within ZIP 32 range");
-const _: () = assert!(FINGERPRINT_LEN == 32, "fingerprint is a 32-byte BLAKE2b digest");
+const _: () = assert!(
+    FINGERPRINT_LEN == 32,
+    "fingerprint is a 32-byte BLAKE2b digest"
+);
 const _: () = assert!(SEALING_KEY_LEN == 32, "XChaCha20Poly1305 key is 32 bytes");
 const _: () = assert!(NONCE_LEN == 24, "XChaCha20Poly1305 nonce is 24 bytes");
 const _: () = assert!(TAG_LEN == 16, "Poly1305 tag is 16 bytes");
-const _: () = assert!(CIPHERTEXT_LEN == SEED_LEN + TAG_LEN, "ciphertext = plaintext + tag");
+const _: () = assert!(
+    CIPHERTEXT_LEN == SEED_LEN + TAG_LEN,
+    "ciphertext = plaintext + tag"
+);
 
 // zns-keygen only works on x86_64 Linux because RDSEED and /dev/sev-guest
 // are x86_64 Linux-specific. On any other platform, the build fails.
@@ -197,9 +185,15 @@ fn main() {
     println!("attestation: {}", attestation_path.display());
     println!("seed_fingerprint: {fingerprint}");
     println!("capsule_hash_blake2b256: {}", hex::encode(capsule_hash));
-    println!("attestation_hash_blake2b256: {}", hex::encode(attestation_hash));
+    println!(
+        "attestation_hash_blake2b256: {}",
+        hex::encode(attestation_hash)
+    );
     println!("measurement: {measurement}");
-    println!("report_data_hash_blake2b256: {}", hex::encode(report_data_hash));
+    println!(
+        "report_data_hash_blake2b256: {}",
+        hex::encode(report_data_hash)
+    );
     println!("migration: none");
     println!("signer_socket: none");
 }
@@ -264,26 +258,28 @@ impl SealingKey {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct SeedCapsule {
-    magic: [u8; 8],           // "ZNSCAPS1" — identifies the file format
-    fingerprint: [u8; FINGERPRINT_LEN],  // ZIP-32 seed fingerprint (plaintext, not secret)
-    nonce: Vec<u8>,           // 24-byte XChaCha20Poly1305 nonce (random, stored in plaintext by design)
-    ciphertext: Vec<u8>,      // 48 bytes: 32-byte encrypted seed + 16-byte Poly1305 auth tag
+    magic: [u8; 8],                     // "ZNSCAPS1" — identifies the file format
+    fingerprint: [u8; FINGERPRINT_LEN], // ZIP-32 seed fingerprint (plaintext, not secret)
+    nonce: Vec<u8>, // 24-byte XChaCha20Poly1305 nonce (random, stored in plaintext by design)
+    ciphertext: Vec<u8>, // 48 bytes: 32-byte encrypted seed + 16-byte Poly1305 auth tag
 }
 
 /// Encrypt the seed into a capsule using the SEV-SNP-derived sealing key.
 ///
 /// The encryption uses XChaCha20Poly1305, an AEAD (Authenticated Encryption
-/// with Associated Data) cipher. The "associated data" (AAD) includes the
-/// capsule magic, the seed fingerprint, and the context string. This means:
+/// with Associated Data) cipher. The "associated data" (AAD) is just the
+/// capsule magic and the seed fingerprint. This means:
 ///
 /// - Tampering with the ciphertext is detected (Poly1305 tag fails to verify)
-/// - The capsule can't be decrypted in a different context (AAD mismatch)
-/// - The capsule can't be swapped with another capsule's ciphertext (fingerprint in AAD)
-fn seal_seed(
-    seed: &Seed,
-    sealing_key: &SealingKey,
-    fingerprint: SeedFingerprint,
-) -> SeedCapsule {
+/// - The capsule can't be swapped with another capsule's ciphertext
+///   (fingerprint in AAD won't match)
+///
+/// Network binding (testnet vs mainnet) and sealing policy are NOT in the
+/// AAD — they are enforced by the SEV-SNP key derivation itself. Different
+/// VM launches get different keys, so a capsule sealed on one VM can't be
+/// decrypted on another. The AAD only needs to bind the ciphertext to the
+/// capsule format and this specific seed.
+fn seal_seed(seed: &Seed, sealing_key: &SealingKey, fingerprint: SeedFingerprint) -> SeedCapsule {
     // Create the cipher instance from the sealing key.
     let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
         .expect("sealing key length is const-asserted to 32 bytes");
@@ -300,20 +296,22 @@ fn seal_seed(
     let aad = capsule_aad(fingerprint);
 
     // XChaCha20Poly1305 needs the nonce as a specific type reference.
-    let nonce_ref = <&XNonce>::try_from(nonce.as_slice())
-        .expect("nonce length is const-asserted to 24 bytes");
+    let nonce_ref =
+        <&XNonce>::try_from(nonce.as_slice()).expect("nonce length is const-asserted to 24 bytes");
 
     // Encrypt the seed. The closure temporarily exposes the raw seed
     // bytes for encryption, then the Zeroizing wrapper wipes them.
-    let ciphertext = seed.expose(|seed_bytes| {
-        cipher.encrypt(
-            nonce_ref,
-            Payload {
-                msg: seed_bytes,
-                aad: &aad,
-            },
-        )
-    }).expect("failed to encrypt seed");
+    let ciphertext = seed
+        .expose(|seed_bytes| {
+            cipher.encrypt(
+                nonce_ref,
+                Payload {
+                    msg: seed_bytes,
+                    aad: &aad,
+                },
+            )
+        })
+        .expect("failed to encrypt seed");
 
     // Sanity check: the ciphertext should be exactly 48 bytes
     // (32-byte seed + 16-byte Poly1305 tag).
@@ -334,17 +332,19 @@ fn seal_seed(
 
 /// Build the AAD (additional authenticated data) for the capsule encryption.
 ///
-/// AAD = magic || fingerprint || context
+/// AAD = magic || fingerprint
 ///
-/// The magic identifies the file format, the fingerprint binds the
-/// ciphertext to this specific seed, and the context string binds it to
-/// this network and account allocation. None of this is secret, but all
-/// of it is authenticated — change any byte and decryption fails.
+/// The magic identifies the file format (prevents mixing capsule types).
+/// The fingerprint binds the ciphertext to this specific seed (prevents
+/// swapping ciphertexts between capsules).
+///
+/// Network and sealing-policy binding are NOT here — they are enforced by
+/// the SEV-SNP key derivation, not by the AAD. Putting them in the AAD
+/// would be a redundant label, not an enforcement.
 fn capsule_aad(fingerprint: SeedFingerprint) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(CAPSULE_MAGIC.len() + FINGERPRINT_LEN + CAPSULE_CONTEXT.len());
+    let mut aad = Vec::with_capacity(CAPSULE_MAGIC.len() + FINGERPRINT_LEN);
     aad.extend_from_slice(CAPSULE_MAGIC);
     aad.extend_from_slice(&fingerprint.to_bytes());
-    aad.extend_from_slice(CAPSULE_CONTEXT);
     aad
 }
 
@@ -358,27 +358,26 @@ fn capsule_aad(fingerprint: SeedFingerprint) -> Vec<u8> {
 
 #[derive(serde::Serialize)]
 struct CustodyManifest {
-    manifest_version: u8,          // Format version (1)
-    network: &'static str,          // "mainnet"
-    seed_fingerprint: String,       // Bech32m ZIP-32 fingerprint
-    capsule_file: &'static str,     // "zns_seed.capsule"
-    capsule_hash_blake2b256: String, // Hash of the capsule file
-    capsule_format: String,        // "ZNSCAPS1"
-    capsule_context: String,       // The context string (for verification)
-    seed_length: usize,            // 32 bytes
-    treasury_account: u32,          // ZIP-32 account 0
-    registry_account: u32,         // ZIP-32 account 1
-    sealing: &'static str,         // "amd-sev-snp-vmrk-instance-bound"
-    sealing_root_key: &'static str, // "vmrk" (which SEV-SNP root key was used)
-    sealing_guest_fields: &'static str, // Which guest fields were bound into the key
-    rng: &'static str,             // "rdseed"
-    attestation_file: &'static str,    // "zns_attestation.bin"
+    manifest_version: u8,                // Format version (1)
+    network: &'static str,               // "mainnet"
+    seed_fingerprint: String,            // Bech32m ZIP-32 fingerprint
+    capsule_file: &'static str,          // "zns_seed.capsule"
+    capsule_hash_blake2b256: String,     // Hash of the capsule file
+    capsule_format: String,              // "ZNSCAPS1"
+    seed_length: usize,                  // 32 bytes
+    treasury_account: u32,               // ZIP-32 account 0
+    registry_account: u32,               // ZIP-32 account 1
+    sealing: &'static str,               // "amd-sev-snp-vmrk-instance-bound"
+    sealing_root_key: &'static str,      // "vmrk" (which SEV-SNP root key was used)
+    sealing_guest_fields: &'static str,  // Which guest fields were bound into the key
+    rng: &'static str,                   // "rdseed"
+    attestation_file: &'static str,      // "zns_attestation.bin"
     attestation_hash_blake2b256: String, // Hash of the attestation report
     report_data_hash_blake2b256: String, // Hash of the report_data we put in the report
-    measurement: String,           // VM launch measurement (hex) — the code hash
-    attestation_sig_algo: &'static str, // "ecdsa-p256-sha384"
-    migration: &'static str,       // "none" — no migration path in v1
-    signer_socket: &'static str,   // "none" — keygen doesn't sign
+    measurement: String,                 // VM launch measurement (hex) — the code hash
+    attestation_sig_algo: &'static str,  // "ecdsa-p256-sha384"
+    migration: &'static str,             // "none" — no migration path in v1
+    signer_socket: &'static str,         // "none" — keygen doesn't sign
 }
 
 /// Build the manifest TOML string from the ceremony's outputs.
@@ -396,7 +395,6 @@ fn custody_manifest(
         capsule_file: CAPSULE_FILE,
         capsule_hash_blake2b256: hex::encode(capsule_hash),
         capsule_format: String::from_utf8_lossy(CAPSULE_MAGIC).into_owned(),
-        capsule_context: String::from_utf8_lossy(CAPSULE_CONTEXT).into_owned(),
         seed_length: SEED_LEN,
         treasury_account: TREASURY_ACCOUNT,
         registry_account: REGISTRY_ACCOUNT,
@@ -621,7 +619,10 @@ fn derive_instance_bound_sev_sealing_key() -> SealingKey {
 /// so we refuse to start if anything is already there.
 fn ensure_absent(path: &Path) {
     match fs::symlink_metadata(path) {
-        Ok(_) => panic!("{} already exists; refusing to create another genesis capsule", path.display()),
+        Ok(_) => panic!(
+            "{} already exists; refusing to create another genesis capsule",
+            path.display()
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => panic!("failed to inspect {}: {err}", path.display()),
     }
@@ -637,8 +638,8 @@ fn ensure_absent(path: &Path) {
 fn write_new_file(path: &Path, bytes: &[u8]) {
     let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true)       // Fail if the file already exists
-        .mode(0o600)            // Owner read/write only
+        .create_new(true) // Fail if the file already exists
+        .mode(0o600) // Owner read/write only
         .open(path)
         .expect("failed to create file");
 
@@ -680,15 +681,15 @@ mod tests {
     fn known_seed_matches_zip32_reference_vector() {
         // Test seed: sequential bytes 0x00 through 0x1f
         let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
         // Expected fingerprint (from the ZIP-32 spec)
         let expected: [u8; 32] = [
-            0xde, 0xff, 0x60, 0x4c, 0x24, 0x67, 0x10, 0xf7, 0x17, 0x6d, 0xea,
-            0xd0, 0x2a, 0xa7, 0x46, 0xf2, 0xfd, 0x8d, 0x53, 0x89, 0xf7, 0x07,
-            0x25, 0x56, 0xdc, 0xb5, 0x55, 0xfd, 0xbe, 0x5e, 0x3a, 0xe3,
+            0xde, 0xff, 0x60, 0x4c, 0x24, 0x67, 0x10, 0xf7, 0x17, 0x6d, 0xea, 0xd0, 0x2a, 0xa7,
+            0x46, 0xf2, 0xfd, 0x8d, 0x53, 0x89, 0xf7, 0x07, 0x25, 0x56, 0xdc, 0xb5, 0x55, 0xfd,
+            0xbe, 0x5e, 0x3a, 0xe3,
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
         assert_eq!(fp.to_bytes(), expected);
@@ -723,9 +724,9 @@ mod tests {
     #[test]
     fn manifest_serializes_to_toml() {
         let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
         let manifest = custody_manifest(
@@ -747,9 +748,9 @@ mod tests {
     #[test]
     fn mint_config_contains_fingerprint() {
         let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
         let config = mint_config_toml(fp);

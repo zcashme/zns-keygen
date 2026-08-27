@@ -30,7 +30,7 @@ When executed, `zns-keygen`:
 3. Computes the ZIP-32 seed fingerprint locally:
    `BLAKE2b-256(personal="Zcash_HD_Seed_FP", [seed_len] || seed)`, displayed as
    Bech32m with HRP `zip32seedfp`.
-4. Derives an instance-bound SEV-SNP VMRK sealing key using guest policy, image
+4. Derives an instance-bound SEV-SNP VCEK sealing key using guest policy, image
    ID, family ID, and measurement.
 5. Encrypts the seed with `XChaCha20Poly1305`, binding the capsule magic
    and seed fingerprint into the AAD (Additional Authenticated Data).
@@ -84,7 +84,7 @@ capsule or swapping ciphertext between capsules is detected:
 - The seed fingerprint.
 
 Network and sealing-policy binding are enforced by the SEV-SNP key derivation
-itself: different VM launches get different VMRK-derived sealing keys, so a
+itself: different physical CPUs get different VCEK-derived sealing keys, so a
 capsule sealed on one VM cannot be decrypted on another.
 
 ## Custody Manifest
@@ -136,14 +136,14 @@ zeros or all 0xFF) are rejected.
 ### What this protects against
 
 - **Host/hypervisor reading the capsule offline.** The sealing key is derived
-  from the AMD SEV-SNP VMRK and guest fields. A different VM, a different
+  from the AMD SEV-SNP VCEK and guest fields. A different CPU, a different
   launch, or a different measurement cannot recreate the key and cannot
   decrypt the capsule.
 - **Capsule tampering.** The Poly1305 authentication tag fails decryption if
   the ciphertext, nonce, or AAD are modified.
 - **Ciphertext reuse across contexts.** The AAD binds the capsule magic and
   seed fingerprint, so a capsule cannot be replayed with different ciphertext.
-  Network binding is enforced by the SEV-SNP VMRK, which is unique per VM launch.
+  Network binding is enforced by the SEV-SNP VCEK, which is unique per physical CPU.
 - **Accidental re-run.** `zns-keygen` refuses to overwrite an existing capsule
   or manifest.
 
@@ -152,7 +152,7 @@ zeros or all 0xFF) are rejected.
 - **Root/admin inside the guest.** SEV-SNP protects the guest from the host,
   not from itself. Any process with access to `/dev/sev-guest` inside the same
   measured guest can re-derive the same sealing key and decrypt the capsule.
-  SEV-SNP sealing provides **VM-bound secrecy, not process-bound secrecy**.
+  SEV-SNP sealing provides **chip-bound secrecy, not process-bound secrecy**.
 - **Modified guest software.** If an attacker boots a different image that
   still has access to the SEV-SNP derived-key interface, they can request the
   same key. The measurement binding mitigates this only if the capsule is

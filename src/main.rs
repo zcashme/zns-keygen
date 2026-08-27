@@ -383,8 +383,8 @@ struct CustodyManifest {
     seed_length: usize,                  // 32 bytes
     treasury_account: u32,               // ZIP-32 account 0
     registry_account: u32,               // ZIP-32 account 1
-    sealing: &'static str,               // "amd-sev-snp-vmrk-instance-bound"
-    sealing_root_key: &'static str,      // "vmrk" (which SEV-SNP root key was used)
+    sealing: &'static str,               // "amd-sev-snp-vcek-chip-bound"
+    sealing_root_key: &'static str,      // "vcek" (which SEV-SNP root key was used)
     sealing_guest_fields: &'static str,  // Which guest fields were bound into the key
     guest_policy: String,                // Actual guest policy value from attestation (hex)
     image_id: String,                   // Actual image ID from attestation (hex)
@@ -420,8 +420,8 @@ fn custody_manifest(
         seed_length: SEED_LEN,
         treasury_account: TREASURY_ACCOUNT,
         registry_account: REGISTRY_ACCOUNT,
-        sealing: "amd-sev-snp-vmrk-instance-bound",
-        sealing_root_key: "vmrk",
+        sealing: "amd-sev-snp-vcek-chip-bound",
+        sealing_root_key: "vcek",
         sealing_guest_fields: "guest_policy,image_id,family_id,measurement",
         guest_policy: format!("0x{guest_policy:016x}"),
         image_id: hex::encode(image_id),
@@ -532,8 +532,10 @@ fn fill_entropy(dest: &mut [u8]) {
 
 /// Derive an instance-bound sealing key from the AMD SEV-SNP hardware.
 ///
-/// The SEV-SNP firmware has a VMRK (VM Root Key) that is unique to each
-/// VM launch. We request a derived key that incorporates:
+/// We request a key derived from the VCEK (Versioned Chip Endorsement Key)
+/// — a per-chip secret that lives inside the AMD Secure Processor (ASP)
+/// and is stable across reboots on the same physical CPU. The derived key
+/// also incorporates the following guest fields:
 ///
 /// - The guest policy (VM configuration flags)
 /// - The image ID (set at launch time)
@@ -541,12 +543,19 @@ fn fill_entropy(dest: &mut [u8]) {
 /// - The measurement (hash of the guest's initial code)
 ///
 /// This means the sealing key is bound to:
-/// - This specific VM launch (VMRK is per-launch)
+/// - This specific physical CPU (VCEK is per-chip)
 /// - The specific guest image (measurement)
 /// - The specific launch configuration (policy, image_id, family_id)
 ///
-/// A different VM, a different launch, or a different image would get a
-/// different key and could not decrypt the capsule.
+/// The capsule survives reboots on the same machine (same VCEK) but
+/// cannot be decrypted on a different physical CPU (different VCEK) or
+/// with a different guest image (different measurement).
+///
+/// Note: VMRK (root_key_select=1) is the conceptually correct key for
+/// sealing per AMD's design intent, but it is random per VM launch
+/// without a Migration Agent, making it unsuitable for persistent
+/// sealing. VCEK (root_key_select=0) is stable across reboots and is
+/// the practical choice for capsule sealing.
 ///
 /// The key is wrapped in Zeroizing so it's wiped from memory when done.
 fn derive_instance_bound_sev_sealing_key() -> SealingKey {
@@ -561,14 +570,18 @@ fn derive_instance_bound_sev_sealing_key() -> SealingKey {
     guest_fields.set_family_id(true);
     guest_fields.set_measurement(true);
 
-    // The first parameter (true) means "include the guest policy in the
-    // key derivation." The three zeros are VMPL, root_key_select, and
-    // an optional override — we use defaults for all.
+    // Parameters: (include_guest_policy, guest_field_select, vmpl=0,
+    //              root_key_select=0 (VCEK), guest_svn=0, override=None)
+    //
+    // root_key_select=0 selects VCEK as the root key. VCEK is per-chip
+    // and stable across reboots, making it suitable for persistent
+    // sealing. root_key_select=1 (VMRK) is per-launch and random
+    // without a Migration Agent.
     let request = DerivedKey::new(true, guest_fields, 0, 0, 0, None);
 
     let mut key = firmware
         .get_derived_key(Some(1), request)
-        .expect("failed to derive SEV-SNP VMRK sealing key");
+        .expect("failed to derive SEV-SNP VCEK sealing key");
 
     // Wrap in Zeroizing and wipe the raw key bytes.
     let sealing_key = SealingKey(Zeroizing::new(key));

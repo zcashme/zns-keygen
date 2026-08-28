@@ -130,11 +130,12 @@ fn main() {
     // seed produced this capsule without knowing the seed itself.
     let fingerprint = seed.fingerprint();
 
-    // Step 3: Derive a sealing key from the AMD SEV-SNP hardware.
-    // This key is unique to this specific VM launch — a different VM
-    // (even with the same image) would get a different key. This is
-    // what makes the capsule "sealed" to this VM instance.
-    let sealing_key = derive_instance_bound_sev_sealing_key();
+    // Step 3: Derive the sealing key from the AMD SEV-SNP hardware.
+    // K_seal = VCEK × measurement × guest policy. It exists only when
+    // this exact image runs on this exact chip under strict launch
+    // terms; every other combination derives a different key and cannot
+    // decrypt the capsule.
+    let sealing_key = derive_sealing_key();
 
     // Step 4: Encrypt the seed into the capsule. The capsule contains
     // the ciphertext (encrypted seed + auth tag), the nonce, and the
@@ -167,8 +168,7 @@ fn main() {
         &attestation_hash,
         &measurement,
         attestation.guest_policy,
-        &attestation.image_id,
-        &attestation.family_id,
+        &attestation.tcb_version,
     );
     let mint_config = mint_config_toml(fingerprint);
 
@@ -195,8 +195,7 @@ fn main() {
     );
     println!("measurement: {measurement}");
     println!("guest_policy: 0x{:016x}", attestation.guest_policy);
-    println!("image_id: {}", hex::encode(attestation.image_id));
-    println!("family_id: {}", hex::encode(attestation.family_id));
+    println!("tcb_version: {}", attestation.tcb_version);
     println!(
         "report_data_hash_blake2b256: {}",
         hex::encode(report_data_hash)
@@ -387,8 +386,7 @@ struct CustodyManifest {
     sealing_root_key: &'static str,      // "vcek" (which SEV-SNP root key was used)
     sealing_guest_fields: &'static str,  // Which guest fields were bound into the key
     guest_policy: String,                // Actual guest policy value from attestation (hex)
-    image_id: String,                   // Actual image ID from attestation (hex)
-    family_id: String,                  // Actual family ID from attestation (hex)
+    tcb_version: String,                 // Platform TCB at genesis (from attestation)
     rng: &'static str,                   // "rdseed"
     attestation_file: &'static str,      // "zns_attestation.bin"
     attestation_hash_blake2b256: String, // Hash of the attestation report
@@ -407,8 +405,7 @@ fn custody_manifest(
     attestation_hash: &[u8; 32],
     measurement: &str,
     guest_policy: u64,
-    image_id: &[u8; 16],
-    family_id: &[u8; 16],
+    tcb_version: &str,
 ) -> String {
     let manifest = CustodyManifest {
         manifest_version: 1,
@@ -422,10 +419,9 @@ fn custody_manifest(
         registry_account: REGISTRY_ACCOUNT,
         sealing: "amd-sev-snp-vcek-chip-bound",
         sealing_root_key: "vcek",
-        sealing_guest_fields: "guest_policy,image_id,family_id,measurement",
+        sealing_guest_fields: "guest_policy,measurement",
         guest_policy: format!("0x{guest_policy:016x}"),
-        image_id: hex::encode(image_id),
-        family_id: hex::encode(family_id),
+        tcb_version: tcb_version.to_string(),
         rng: "rdseed",
         attestation_file: ATTESTATION_FILE,
         attestation_hash_blake2b256: hex::encode(attestation_hash),
@@ -530,54 +526,54 @@ fn fill_entropy(dest: &mut [u8]) {
 
 // ── SEV-SNP sealing key derivation ────────────────────────────────────
 
-/// Derive an instance-bound sealing key from the AMD SEV-SNP hardware.
+/// Derive the sealing key from the AMD SEV-SNP hardware.
 ///
-/// We request a key derived from the VCEK (Versioned Chip Endorsement Key)
-/// — a per-chip secret that lives inside the AMD Secure Processor (ASP)
-/// and is stable across reboots on the same physical CPU. The derived key
-/// also incorporates the following guest fields:
+/// K_seal is derived from exactly three inputs, all observed and stored
+/// by the AMD Secure Processor itself, so none of them can be faked by
+/// the hypervisor:
 ///
-/// - The guest policy (VM configuration flags)
-/// - The image ID (set at launch time)
-/// - The family ID (set at launch time)
-/// - The measurement (hash of the guest's initial code)
+/// - **VCEK** (`root_key_select = false`) — a per-chip secret that lives
+///   inside the secure processor and never leaves it. Makes the key
+///   specific to this physical CPU and stable across reboots.
+/// - **measurement** — the hash of the guest's initial code, computed by
+///   the firmware as the image is loaded at launch. Makes the key
+///   specific to this exact image.
+/// - **guest policy** — the launch-condition flags (debug, SMT, migration).
+///   Makes the key specific to strict launch terms: the same image
+///   launched with debugging enabled derives a different key, so a
+///   hostile relaunch of our own image cannot open the capsule.
 ///
-/// This means the sealing key is bound to:
-/// - This specific physical CPU (VCEK is per-chip)
-/// - The specific guest image (measurement)
-/// - The specific launch configuration (policy, image_id, family_id)
+/// Deliberately NOT mixed in:
+/// - image ID / family ID — hypervisor-supplied labels with no security
+///   content; including them makes the key brittle to launch-blob drift.
+/// - guest SVN / TCB version / VMPL — unused machinery; identity values.
 ///
-/// The capsule survives reboots on the same machine (same VCEK) but
-/// cannot be decrypted on a different physical CPU (different VCEK) or
-/// with a different guest image (different measurement).
-///
-/// Note: VMRK (root_key_select=1) is the conceptually correct key for
-/// sealing per AMD's design intent, but it is random per VM launch
-/// without a Migration Agent, making it unsuitable for persistent
-/// sealing. VCEK (root_key_select=0) is stable across reboots and is
-/// the practical choice for capsule sealing.
+/// Consequences:
+/// - The capsule survives reboots on the same physical CPU (same VCEK).
+/// - A different CPU, a modified image, or a debug-enabled relaunch all
+///   derive a different key and cannot decrypt the capsule.
 ///
 /// The key is wrapped in Zeroizing so it's wiped from memory when done.
-fn derive_instance_bound_sev_sealing_key() -> SealingKey {
+fn derive_sealing_key() -> SealingKey {
     let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
 
-    // Select which guest fields to include in the key derivation.
-    // All four fields are included so the key is maximally bound to
-    // this specific VM launch configuration.
+    // Mix exactly two guest fields into the key:
+    //   bit 0: guest policy (launch conditions)
+    //   bit 3: measurement  (code identity)
     let mut guest_fields = GuestFieldSelect::default();
     guest_fields.set_guest_policy(true);
-    guest_fields.set_image_id(true);
-    guest_fields.set_family_id(true);
     guest_fields.set_measurement(true);
 
-    // Parameters: (include_guest_policy, guest_field_select, vmpl=0,
-    //              root_key_select=0 (VCEK), guest_svn=0, override=None)
+    // Parameters: (root_key_select, guest_field_select, vmpl, guest_svn,
+    //              tcb_version, launch_mit_vector)
     //
-    // root_key_select=0 selects VCEK as the root key. VCEK is per-chip
-    // and stable across reboots, making it suitable for persistent
-    // sealing. root_key_select=1 (VMRK) is per-launch and random
-    // without a Migration Agent.
-    let request = DerivedKey::new(true, guest_fields, 0, 0, 0, None);
+    // root_key_select: false = VCEK (per-chip, stable across reboots).
+    //   true = VMRK, which is RANDOM PER LAUNCH without a Migration
+    //   Agent — using it would brick the capsule on first reboot. This
+    //   was a real bug: the crate's first parameter is root_key_select,
+    //   not a guest-policy flag.
+    // vmpl / guest_svn / tcb_version: identity values (0).
+    let request = DerivedKey::new(false, guest_fields, 0, 0, 0, None);
 
     let mut key = firmware
         .get_derived_key(Some(1), request)
@@ -722,16 +718,16 @@ mod tests {
             &[0u8; 32],
             "0000000000000000000000000000000000000000000000000000000000000000",
             0x30000, // example guest policy
-            &[0u8; 16],
-            &[0u8; 16],
+            "bootloader=0 tee=0 snp=0 microcode=0",
         );
         assert!(manifest.contains("seed_fingerprint"));
         assert!(manifest.contains("mainnet"));
         assert!(manifest.contains("attestation_file"));
         assert!(manifest.contains("measurement"));
         assert!(manifest.contains("guest_policy"));
-        assert!(manifest.contains("image_id"));
-        assert!(manifest.contains("family_id"));
+        assert!(manifest.contains("tcb_version"));
+        assert!(!manifest.contains("image_id"));
+        assert!(!manifest.contains("family_id"));
     }
 
     /// Verify that the mint config includes the expected seed fingerprint.

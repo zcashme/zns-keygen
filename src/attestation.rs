@@ -34,10 +34,8 @@ pub struct Attestation {
     pub measurement: [u8; 48],
     /// Guest policy value (u64, hex in manifest).
     pub guest_policy: u64,
-    /// Image ID set at launch (16 bytes, hex in manifest).
-    pub image_id: [u8; 16],
-    /// Family ID set at launch (16 bytes, hex in manifest).
-    pub family_id: [u8; 16],
+    /// Platform TCB at report time (components formatted for the manifest).
+    pub tcb_version: String,
     /// The report_data we supplied (kept for self-verification).
     pub report_data: [u8; REPORT_DATA_LEN],
 }
@@ -119,12 +117,15 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     let report = AttestationReport::from_bytes(&report_bytes)
         .expect("failed to parse SEV-SNP attestation report");
 
+    let tcb = report.current_tcb;
     let attestation = Attestation {
         report_bytes,
         measurement: report.measurement,
         guest_policy: report.policy.into(),
-        image_id: report.image_id,
-        family_id: report.family_id,
+        tcb_version: format!(
+            "bootloader={} tee={} snp={} microcode={}",
+            tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
+        ),
         report_data: *requested_report_data,
     };
 

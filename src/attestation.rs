@@ -16,7 +16,10 @@
 //!      we write anything to disk.
 
 use blake2b_simd::Params as Blake2bParams;
+#[cfg(target_os = "linux")]
 use sev::firmware::guest::{AttestationReport, Firmware};
+#[cfg(not(target_os = "linux"))]
+use sev::firmware::guest::AttestationReport;
 use sev::parser::ByteParser;
 
 use crate::fingerprint::SeedFingerprint;
@@ -107,6 +110,18 @@ pub fn report_data(fingerprint: &SeedFingerprint, capsule_hash: &[u8; 32]) -> [u
 /// 6. Checks the `report_data` matches
 ///    `BLAKE2b-512(fingerprint ‖ capsule_hash)`
 pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Attestation {
+            report_bytes: Vec::new(),
+            measurement: [0u8; 48],
+            guest_policy: 0,
+            tcb_version: "dev".into(),
+            report_data: *requested_report_data,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
     let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
 
     let report_bytes = firmware
@@ -133,4 +148,5 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     attestation.verify_report_data();
 
     attestation
+    }
 }

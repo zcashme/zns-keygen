@@ -40,13 +40,12 @@ impl CeremonyKeys {
     }
 
     /// Treasury P2PKH address.
-    pub fn treasury_taddr<P: Parameters>(&self, network: &P) -> String {
+    pub fn treasury_taddr<P: Parameters>(&self, _network: &P) -> transparent::address::TransparentAddress {
         let account_pub = self.treasury_transparent().to_account_pubkey();
         let external_ivk = account_pub
             .derive_external_ivk()
             .expect("FATAL: Treasury IVK");
-        let (addr, _) = external_ivk.default_address();
-        addr.to_zcash_address(network.network_type()).encode()
+        external_ivk.default_address().0
     }
 
     /// Registry Orchard FVK.

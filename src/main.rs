@@ -20,7 +20,8 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Parameters};
+use zcash_protocol::value::Zatoshis;
 #[cfg(target_os = "linux")]
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(not(target_os = "linux"))]
@@ -72,7 +73,6 @@ const NETWORK: Network = zcash_protocol::consensus::TEST_NETWORK;
 const NETWORK_LABEL: &str = "testnet";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-const ANCHOR_CONFIRMATIONS: u32 = 3;
 
 fn main() {
     tracing_subscriber::fmt().init();
@@ -97,8 +97,11 @@ fn main() {
         let secret = Secret::new(*seed_bytes);
         CeremonyKeys::derive(&NETWORK, &secret)
     });
-    let taddr = keys.treasury_taddr(&NETWORK);
-    tracing::info!("Treasury t-address: {taddr}");
+    let treasury_addr = keys.treasury_taddr(&NETWORK);
+    let taddr_encoded = treasury_addr
+        .to_zcash_address(NETWORK.network_type())
+        .encode();
+    tracing::info!("Treasury t-address: {taddr_encoded}");
 
     let sealing_key = derive_sealing_key();
     let capsule = seal_seed(&seed, &sealing_key, fingerprint);
@@ -130,11 +133,32 @@ fn main() {
     tracing::info!("capsule + manifest + config + attestation written");
 
     tracing::info!("=== FUNDING ===");
-    tracing::info!("send {NETWORK_LABEL} ZEC to: {taddr}");
-    tracing::info!("polling Zebra every {}s", POLL_INTERVAL.as_secs());
+    tracing::info!("send {NETWORK_LABEL} ZEC to: {taddr_encoded}");
+    let min_zat = 30_000;
+    tracing::info!("minimum {min_zat} zat for 1 anchor, each additional 10,000 zat creates one more");
 
-    let utxos = wait_for_funding(&taddr, &keys);
-    tracing::info!(utxos = utxos.len(), "funding detected");
+    let pubkey = keys
+        .treasury_transparent()
+        .to_account_pubkey()
+        .derive_address_pubkey(
+            transparent::keys::TransparentKeyScope::EXTERNAL,
+            transparent::keys::NonHardenedChildIndex::from_index(0).unwrap(),
+        )
+        .expect("FATAL: pubkey derivation");
+
+    let utxos = loop {
+        match check_funding(&treasury_addr) {
+            Some(raw) => {
+                let funded: Vec<_> = raw
+                    .into_iter()
+                    .map(|u| utxo_to_funding(&u, pubkey))
+                    .collect();
+                tracing::info!(utxos = funded.len(), "funding sufficient");
+                break funded;
+            }
+            None => std::thread::sleep(POLL_INTERVAL),
+        }
+    };
 
     tracing::info!("=== ANCHOR CREATION ===");
     let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
@@ -147,11 +171,11 @@ fn main() {
     let txid = tx.txid().to_string();
     tracing::info!(txid, "anchor tx built, submitting");
 
-    let submitted = rpc::Rpc::send_raw(&tx_hex).expect("FATAL: sendrawtransaction");
-    tracing::info!(txid = submitted, "anchor tx broadcast");
+    rpc::Rpc::send_raw(&tx_hex).expect("FATAL: sendrawtransaction");
+    tracing::info!(txid, "anchor tx broadcast");
 
-    let birthday = wait_for_confirmation(&txid);
-    tracing::info!(height = u32::from(birthday), "anchor confirmed");
+    let (birthday, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
+    tracing::info!(height = u32::from(birthday), "birthday");
 
     let final_config = mint_config_toml_with_birthday(fingerprint, birthday);
     fs::write(mint_config_path, final_config.as_bytes())
@@ -162,98 +186,39 @@ fn main() {
     tracing::info!(birthday = u32::from(birthday), "genesis done");
 }
 
-fn wait_for_funding(taddr: &str, keys: &CeremonyKeys) -> Vec<anchor::FundingUtxo> {
-    let mut last_height = None;
-    loop {
-        let (tip_height, _) = match rpc::Rpc::tip() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "Zebra unreachable");
-                std::thread::sleep(POLL_INTERVAL);
-                continue;
-            }
-        };
-
-        if last_height != Some(tip_height) {
-            tracing::info!(height = u32::from(tip_height), "scanning for funding");
-            last_height = Some(tip_height);
-        }
-
-        if let Some(utxos) = scan_block_for_funding(tip_height, taddr, keys) {
-            if !utxos.is_empty() {
-                return utxos;
-            }
-        }
-
-        std::thread::sleep(POLL_INTERVAL);
+/// Check for sufficient UTXOs.
+fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
+    let encoded = addr.to_zcash_address(NETWORK.network_type()).encode();
+    let utxos = rpc::Rpc::address_utxos(&encoded).ok()?;
+    if utxos.is_empty() {
+        tracing::info!("no funding yet");
+        return None;
     }
+    let total: u64 = utxos.iter().map(|u| u.satoshis).sum();
+    let min = (utxos.len() as u64 + 2) * 10_000;
+    if total < min {
+        tracing::info!(have = total, need = min, "insufficient");
+        return None;
+    }
+    Some(utxos)
 }
 
-fn scan_block_for_funding(height: BlockHeight, taddr: &str, keys: &CeremonyKeys) -> Option<Vec<anchor::FundingUtxo>> {
-    let block_hex = match rpc::Rpc::block_hex(height) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(error = %e, "getblock failed");
-            return None;
-        }
-    };
+fn utxo_to_funding(u: &rpc::AddressUtxo, pubkey: secp256k1::PublicKey) -> anchor::FundingUtxo {
+    let mut txid_bytes = hex::decode(&u.txid).expect("FATAL: txid hex");
+    txid_bytes.reverse();
+    let mut txid_arr = [0u8; 32];
+    txid_arr.copy_from_slice(&txid_bytes);
 
-    let block_bytes = hex::decode(&block_hex).ok()?;
-    let block = zcash_primitives::block::Block::read(&block_bytes[..], &NETWORK).ok()?;
+    let outpoint = transparent::bundle::OutPoint::new(txid_arr, u.output_index);
+    let value = Zatoshis::from_u64(u.satoshis).expect("FATAL: satoshis");
+    let script_bytes = hex::decode(&u.script).expect("FATAL: script hex");
+    let script = transparent::address::Script(zcash_script::script::Code(script_bytes));
+    let coin = transparent::bundle::TxOut::new(value, script);
 
-    // Derive the expected Treasury address for comparison.
-    let treasury_tkey = keys.treasury_transparent();
-    let account_pub = treasury_tkey.to_account_pubkey();
-    let pubkey = account_pub
-        .derive_address_pubkey(
-            transparent::keys::TransparentKeyScope::EXTERNAL,
-            transparent::keys::NonHardenedChildIndex::from_index(0).unwrap(),
-        )
-        .expect("FATAL: pubkey derivation");
-    let expected_addr = transparent::address::TransparentAddress::from_pubkey(&pubkey);
-
-    let mut found = Vec::new();
-    for tx in block.vtx() {
-        if let Some(bundle) = tx.transparent_bundle() {
-            for (vout, output) in bundle.vout.iter().enumerate() {
-                let script = output.script_pubkey();
-                let parsed = zcash_script::script::PubKey::parse(&script.0).ok();
-                let addr = parsed
-                    .as_ref()
-                    .and_then(transparent::address::TransparentAddress::from_script_pubkey);
-                if addr == Some(expected_addr) {
-                    let outpoint = transparent::bundle::OutPoint::new(
-                        *tx.txid().as_ref(),
-                        vout as u32,
-                    );
-                    found.push(anchor::FundingUtxo {
-                        outpoint,
-                        coin: output.clone(),
-                        pubkey,
-                    });
-                }
-            }
-        }
-    }
-
-    if found.is_empty() { None } else { Some(found) }
-}
-
-fn wait_for_confirmation(txid: &str) -> BlockHeight {
-    loop {
-        match rpc::Rpc::raw_tx(txid) {
-            Ok(tx) => {
-                if tx.confirmations >= ANCHOR_CONFIRMATIONS {
-                    let (tip, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
-                    return tip;
-                }
-                tracing::info!(confirmations = tx.confirmations, "waiting");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "getrawtransaction failed");
-            }
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    anchor::FundingUtxo {
+        outpoint,
+        coin,
+        pubkey,
     }
 }
 

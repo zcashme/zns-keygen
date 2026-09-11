@@ -26,6 +26,7 @@ impl Rpc {
         });
         let resp = ureq::post(RPC_URL)
             .set("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(10))
             .send_json(serde_json::to_value(&body).unwrap())
             .map_err(|e| format!("RPC transport: {e}"))?;
         let parsed: RpcResp<R> = resp
@@ -41,20 +42,12 @@ impl Rpc {
     /// Chain tip height + hash.
     pub fn tip() -> Result<(BlockHeight, String), String> {
         let info: BlockchainInfo = Self::call("getblockchaininfo", serde_json::json!({}))?;
-        let hash = info.best_block_hash;
-        let height = BlockHeight::from_u32(info.blocks);
-        Ok((height, hash))
+        Ok((BlockHeight::from_u32(info.blocks), info.best_block_hash))
     }
 
-    /// Block hex at height.
-    pub fn block_hex(height: BlockHeight) -> Result<String, String> {
-        let h = u32::from(height);
-        Self::call("getblock", serde_json::json!([h.to_string(), 0]))
-    }
-
-    /// Verbose transaction.
-    pub fn raw_tx(txid: &str) -> Result<RawTx, String> {
-        Self::call("getrawtransaction", serde_json::json!([txid, 1]))
+    /// UTXOs for a transparent address.
+    pub fn address_utxos(addr: &str) -> Result<Vec<AddressUtxo>, String> {
+        Self::call("getaddressutxos", serde_json::json!([{"addresses": [addr]}]))
     }
 
     /// Broadcast raw tx hex.
@@ -86,12 +79,12 @@ struct BlockchainInfo {
     best_block_hash: String,
 }
 
-/// Verbose getrawtransaction.
+/// UTXO from getaddressutxos.
 #[derive(Deserialize)]
-pub struct RawTx {
+pub struct AddressUtxo {
     pub txid: String,
-    pub confirmations: u32,
-    pub blockhash: Option<String>,
-    pub blocktime: Option<u64>,
-    pub hex: String,
+    #[serde(rename = "outputIndex")]
+    pub output_index: u32,
+    pub satoshis: u64,
+    pub script: String,
 }

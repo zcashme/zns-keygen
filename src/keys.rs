@@ -2,7 +2,7 @@
 
 use secrecy::{ExposeSecret, Secret};
 use transparent::keys::IncomingViewingKey;
-use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
+use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 
 use crate::{REGISTRY_ACCOUNT, TREASURY_ACCOUNT};
@@ -24,17 +24,7 @@ impl CeremonyKeys {
         Self { treasury, registry }
     }
 
-    /// Treasury USK.
-    pub fn treasury(&self) -> &UnifiedSpendingKey {
-        &self.treasury
-    }
-
-    /// Registry USK.
-    pub fn registry(&self) -> &UnifiedSpendingKey {
-        &self.registry
-    }
-
-    /// Treasury transparent priv key.
+/// Treasury transparent priv key.
     pub fn treasury_transparent(&self) -> &transparent::keys::AccountPrivKey {
         self.treasury.transparent()
     }
@@ -58,13 +48,4 @@ impl CeremonyKeys {
         self.treasury.orchard().into()
     }
 
-    /// Treasury UFVK.
-    pub fn treasury_fvk(&self) -> UnifiedFullViewingKey {
-        self.treasury.to_unified_full_viewing_key()
-    }
-
-    /// Registry UFVK.
-    pub fn registry_fvk(&self) -> UnifiedFullViewingKey {
-        self.registry.to_unified_full_viewing_key()
-    }
 }

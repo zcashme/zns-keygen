@@ -106,35 +106,6 @@ fn main() {
         .encode();
     tracing::info!("Treasury t-address: {taddr_encoded}");
 
-    let sealing_key = derive_sealing_key();
-    let capsule = seal_seed(&seed, &sealing_key, fingerprint);
-    let capsule_bytes = postcard::to_allocvec(&capsule).unwrap();
-    let capsule_hash = blake2b256(&capsule_bytes);
-
-    let report_data = attestation::report_data(&fingerprint, &capsule_hash);
-    let attestation = attestation::request(&report_data);
-    let report_data_hash = blake2b256(&report_data);
-    let attestation_hash = blake2b256(&attestation.report_bytes);
-    let measurement = hex::encode(attestation.measurement);
-
-    let manifest = custody_manifest(
-        fingerprint,
-        &capsule_hash,
-        &report_data_hash,
-        &attestation_hash,
-        &measurement,
-        attestation.guest_policy,
-        &attestation.tcb_version,
-    );
-    let mint_config = mint_config_toml(fingerprint);
-
-    write_secret_file(capsule_path, &capsule_bytes);
-    write_public_file(manifest_path, manifest.as_bytes());
-    write_secret_file(mint_config_path, mint_config.as_bytes());
-    write_public_file(attestation_path, &attestation.report_bytes);
-
-    tracing::info!("capsule + manifest + config + attestation written");
-
     tracing::info!("=== FUNDING ===");
     tracing::info!("send {NETWORK_LABEL} ZEC to: {taddr_encoded}");
     tracing::info!("minimum 500,000 zat (0.005 ZEC) for 40 anchors + Treasury change");
@@ -179,14 +150,40 @@ fn main() {
     let (birthday, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
     tracing::info!(height = u32::from(birthday), "birthday");
 
-    let final_config = mint_config_toml_with_birthday(fingerprint, birthday);
-    fs::write(mint_config_path, final_config.as_bytes())
-        .expect("FATAL: rewrite mint config");
-    tracing::info!("mint config updated with birthday");
+    tracing::info!("=== SEALING ===");
+    let sealing_key = derive_sealing_key();
+    let capsule = seal_seed(&seed, &sealing_key, fingerprint);
+    let capsule_bytes = postcard::to_allocvec(&capsule).unwrap();
+    let capsule_hash = blake2b256(&capsule_bytes);
+
+    let report_data = attestation::report_data(&fingerprint, &capsule_hash);
+    let attestation = attestation::request(&report_data);
+    let report_data_hash = blake2b256(&report_data);
+    let attestation_hash = blake2b256(&attestation.report_bytes);
+    let measurement = hex::encode(attestation.measurement);
+
+    let manifest = custody_manifest(
+        fingerprint,
+        &capsule_hash,
+        &report_data_hash,
+        &attestation_hash,
+        &measurement,
+        attestation.guest_policy,
+        &attestation.tcb_version,
+    );
+    let mint_config = mint_config_toml_with_birthday(fingerprint, birthday);
+
+    write_secret_file(capsule_path, &capsule_bytes);
+    write_public_file(manifest_path, manifest.as_bytes());
+    write_secret_file(mint_config_path, mint_config.as_bytes());
+    write_public_file(attestation_path, &attestation.report_bytes);
+
+    tracing::info!("capsule + manifest + config + attestation written");
 
     tracing::info!("=== CEREMONY COMPLETE ===");
     tracing::info!(birthday = u32::from(birthday), "genesis done");
 }
+
 
 /// Check for sufficient UTXOs.
 fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
@@ -359,11 +356,6 @@ fn custody_manifest(
 
 // ── Mint config ───────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
-struct MintConfig {
-    network: &'static str,
-    expected_seed_fingerprint: String,
-}
 
 #[derive(serde::Serialize)]
 struct MintConfigWithBirthday {
@@ -372,12 +364,6 @@ struct MintConfigWithBirthday {
     birthday: u32,
 }
 
-fn mint_config_toml(fingerprint: SeedFingerprint) -> String {
-    toml::to_string(&MintConfig {
-        network: NETWORK_LABEL,
-        expected_seed_fingerprint: fingerprint.to_string(),
-    }).unwrap()
-}
 
 fn mint_config_toml_with_birthday(fingerprint: SeedFingerprint, birthday: BlockHeight) -> String {
     toml::to_string(&MintConfigWithBirthday {
@@ -544,7 +530,7 @@ mod tests {
             0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
-        let config = mint_config_toml(fp);
+        let config = mint_config_toml_with_birthday(fp, BlockHeight::from_u32(0));
         assert!(config.contains("expected_seed_fingerprint"));
     }
 }

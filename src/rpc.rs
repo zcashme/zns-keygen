@@ -76,6 +76,7 @@ impl std::fmt::Display for RpcError {
 #[derive(Deserialize)]
 struct BlockchainInfo {
     blocks: u32,
+    #[serde(rename = "bestblockhash")]
     best_block_hash: String,
 }
 

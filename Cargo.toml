@@ -31,14 +31,14 @@ secrecy = "0.8"
 zcash_keys = { version = "0.16.1", default-features = false, features = ["orchard", "sapling", "transparent-inputs"] }
 zcash_protocol = { version = "0.10.4", default-features = false }
 zcash_address = "0.13.0"
-zcash_primitives = { version = "0.30.0", default-features = false, features = ["transparent-inputs", "circuits"] }
-secp256k1 = "0.29"
-zcash_script = "0.4"
-sapling = { package = "sapling-crypto", version = "0.7", default-features = false, features = ["circuit"] }
+zcash_primitives = { version = "0.30.0", default-features = false, features = ["transparent-inputs"] }
+sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 orchard = { version = "0.15.5", default-features = false, features = ["circuit"] }
 transparent = { package = "zcash_transparent", version = "0.10.0", default-features = false }
 zip32 = "0.2.1"
 rand = "0.8"
+secp256k1 = "0.29"
+zcash_script = "0.4"
 
 [patch.crates-io]
 orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5.2" }

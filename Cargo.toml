@@ -39,7 +39,3 @@ zip32 = "0.2.1"
 rand = "0.8"
 secp256k1 = "0.29"
 zcash_script = "0.4"
-
-[patch.crates-io]
-orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5.2" }
-zcash_primitives = { git = "https://github.com/zcashme/zns-zcash_primitives.git", tag = "zns-zcash_primitives-v0.30.1.2" }

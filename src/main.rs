@@ -134,8 +134,7 @@ fn main() {
 
     tracing::info!("=== FUNDING ===");
     tracing::info!("send {NETWORK_LABEL} ZEC to: {taddr_encoded}");
-    let min_zat = 30_000;
-    tracing::info!("minimum {min_zat} zat for 1 anchor, each additional 10,000 zat creates one more");
+    tracing::info!("minimum 500,000 zat (0.005 ZEC) for 40 anchors + Treasury change");
 
     let pubkey = keys
         .treasury_transparent()
@@ -146,15 +145,15 @@ fn main() {
         )
         .expect("FATAL: pubkey derivation");
 
-    let utxos = loop {
+    let inputs = loop {
         match check_funding(&treasury_addr) {
             Some(raw) => {
-                let funded: Vec<_> = raw
+                let built: Vec<_> = raw
                     .into_iter()
-                    .map(|u| utxo_to_funding(&u, pubkey))
+                    .map(|u| utxo_to_input(&u, pubkey))
                     .collect();
-                tracing::info!(utxos = funded.len(), "funding sufficient");
-                break funded;
+                tracing::info!(inputs = built.len(), "funding sufficient");
+                break built;
             }
             None => std::thread::sleep(POLL_INTERVAL),
         }
@@ -164,7 +163,7 @@ fn main() {
     let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
     tracing::info!(height = u32::from(tip_height), "chain tip");
 
-    let tx = anchor::build_anchor(&NETWORK, &keys, tip_height, &utxos);
+    let tx = anchor::build_anchor_transaction(&NETWORK, &keys, tip_height, &inputs);
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes).expect("FATAL: serialize tx");
     let tx_hex = hex::encode(&tx_bytes);
@@ -195,15 +194,15 @@ fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<
         return None;
     }
     let total: u64 = utxos.iter().map(|u| u.satoshis).sum();
-    let min = (utxos.len() as u64 + 2) * 10_000;
-    if total < min {
-        tracing::info!(have = total, need = min, "insufficient");
-        return None;
-    }
+    assert!(
+        total >= 500_000,
+        "FATAL: insufficient funding: {total} zat, need at least 500,000"
+    );
     Some(utxos)
 }
 
-fn utxo_to_funding(u: &rpc::AddressUtxo, pubkey: secp256k1::PublicKey) -> anchor::FundingUtxo {
+/// Convert RPC UTXO to transparent input.
+fn utxo_to_input(u: &rpc::AddressUtxo, pubkey: secp256k1::PublicKey) -> transparent::builder::TransparentInputInfo {
     let mut txid_bytes = hex::decode(&u.txid).expect("FATAL: txid hex");
     txid_bytes.reverse();
     let mut txid_arr = [0u8; 32];
@@ -215,11 +214,12 @@ fn utxo_to_funding(u: &rpc::AddressUtxo, pubkey: secp256k1::PublicKey) -> anchor
     let script = transparent::address::Script(zcash_script::script::Code(script_bytes));
     let coin = transparent::bundle::TxOut::new(value, script);
 
-    anchor::FundingUtxo {
+    transparent::builder::TransparentInputInfo::from_parts(
         outpoint,
         coin,
-        pubkey,
-    }
+        transparent::builder::SpendInfo::P2pkh { pubkey },
+    )
+    .expect("FATAL: transparent input")
 }
 
 // ── Seed ──────────────────────────────────────────────────────────

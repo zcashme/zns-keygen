@@ -31,10 +31,11 @@ use fingerprint::SeedFingerprint;
 use keys::CeremonyKeys;
 use secrecy::Secret;
 
-const CAPSULE_FILE: &str = "zns_seed.capsule";
-const MANIFEST_FILE: &str = "zns_custody_manifest.toml";
-const MINT_CONFIG_FILE: &str = "zns_mint.conf";
-const ATTESTATION_FILE: &str = "zns_attestation.bin";
+const KEYS_DIR: &str = "keys";
+const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
+const MANIFEST_FILE: &str = "keys/zns_custody_manifest.toml";
+const MINT_CONFIG_FILE: &str = "keys/zns_mint.conf";
+const ATTESTATION_FILE: &str = "keys/zns_attestation.bin";
 
 const REPORT_DATA_LEN: usize = 64;
 const TREASURY_ACCOUNT: u32 = 0;
@@ -83,6 +84,8 @@ fn main() {
     let manifest_path = Path::new(MANIFEST_FILE);
     let mint_config_path = Path::new(MINT_CONFIG_FILE);
     let attestation_path = Path::new(ATTESTATION_FILE);
+
+    fs::create_dir_all(KEYS_DIR).expect("FATAL: cannot create keys directory");
 
     ensure_absent(capsule_path);
     ensure_absent(manifest_path);

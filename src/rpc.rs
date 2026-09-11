@@ -6,7 +6,7 @@ use zcash_protocol::consensus::BlockHeight;
 #[cfg(not(feature = "testnet"))]
 const RPC_URL: &str = "http://127.0.0.1:8232";
 #[cfg(feature = "testnet")]
-const RPC_URL: &str = "http://127.0.0.1:9998";
+const RPC_URL: &str = "http://127.0.0.1:18232";
 
 /// Stateless JSON-RPC transport.
 pub struct Rpc;

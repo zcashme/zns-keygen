@@ -1,0 +1,57 @@
+# Tests, clippy, rustfmt, docs, and coverage on PRs and master.
+# A failing test or a new clippy warning turns the PR red.
+#
+# mainnet and testnet are mutually exclusive, so this crate cannot use
+# `--all-features`.
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy (mainnet)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (testnet)
+        run: cargo clippy --all-targets --no-default-features --features testnet -- -D warnings
+      - name: test (mainnet)
+        run: cargo test
+      - name: test (testnet)
+        run: cargo test --no-default-features --features testnet
+      - name: docs
+        run: cargo doc --no-deps
+      - name: coverage
+        run: |
+          cargo llvm-cov --html --output-dir coverage
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage/
+          if-no-files-found: error

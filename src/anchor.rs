@@ -174,7 +174,7 @@ pub fn build_anchor_transaction<P: Parameters>(
     let authorized_ironwood = ironwood_bundle
         .create_proof(&pk, &mut rand::rngs::OsRng)
         .expect("FATAL: ironwood proof")
-        .prepare(&mut rand::rngs::OsRng, *shielded_sighash.as_ref())
+        .prepare(rand::rngs::OsRng, *shielded_sighash.as_ref())
         .finalize()
         .expect("FATAL: ironwood finalize");
 

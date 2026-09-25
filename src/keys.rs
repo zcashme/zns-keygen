@@ -39,7 +39,6 @@ impl TreasuryFundingInfo {
                     NonHardenedChildIndex::from_index(0).unwrap(),
                 )
                 .expect("FATAL: pubkey derivation");
-            drop(privkey);
             (address, pubkey)
         };
         Self { address, pubkey }
@@ -84,6 +83,7 @@ impl CeremonyKeys {
     }
 
     /// Treasury P2PKH address.
+    #[cfg(test)]
     pub fn treasury_taddr<P: Parameters>(
         &self,
         _network: &P,
@@ -96,6 +96,7 @@ impl CeremonyKeys {
     }
 
     /// External index-0 pubkey used to spend the Treasury funding output.
+    #[cfg(test)]
     pub fn treasury_external_pubkey(&self) -> secp256k1::PublicKey {
         self.treasury_transparent()
             .to_account_pubkey()
@@ -139,6 +140,5 @@ mod tests {
         let keys = CeremonyKeys::derive(&MAIN_NETWORK, &Secret::new(seed));
         assert_eq!(funding.address(), &keys.treasury_taddr(&MAIN_NETWORK));
         assert_eq!(funding.pubkey(), keys.treasury_external_pubkey());
-        drop(keys);
     }
 }

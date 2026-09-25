@@ -135,20 +135,21 @@ fn main() {
         drop(seed);
         drop(sealing_key);
 
-        tracing::info!("=== ANCHOR CREATION ===");
-        let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
-        tracing::info!(height = u32::from(tip_height), "chain tip");
+        {
+            tracing::info!("=== ANCHOR CREATION ===");
+            let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
+            tracing::info!(height = u32::from(tip_height), "chain tip");
 
-        let tx = anchor::build_anchor_transaction(&NETWORK, &keys, tip_height, &inputs);
-        let mut tx_bytes = Vec::new();
-        tx.write(&mut tx_bytes).expect("FATAL: serialize tx");
-        let tx_hex = hex::encode(&tx_bytes);
-        let txid = tx.txid().to_string();
-        tracing::info!(txid, "anchor tx built, submitting");
+            let tx = anchor::build_anchor_transaction(&NETWORK, &keys, tip_height, &inputs);
+            let mut tx_bytes = Vec::new();
+            tx.write(&mut tx_bytes).expect("FATAL: serialize tx");
+            let tx_hex = hex::encode(&tx_bytes);
+            let txid = tx.txid().to_string();
+            tracing::info!(txid, "anchor tx built, submitting");
 
-        rpc::Rpc::send_raw(&tx_hex).expect("FATAL: sendrawtransaction");
-        tracing::info!(txid, "anchor tx broadcast");
-        drop(keys);
+            rpc::Rpc::send_raw(&tx_hex).expect("FATAL: sendrawtransaction");
+            tracing::info!(txid, "anchor tx broadcast");
+        }
 
         let (birthday, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
         tracing::info!(height = u32::from(birthday), "birthday");
@@ -277,6 +278,7 @@ impl SealingKey {
         &self.0
     }
 
+    #[cfg(test)]
     fn from_bytes(bytes: [u8; SEALING_KEY_LEN]) -> Self {
         SealingKey(Zeroizing::new(bytes))
     }
@@ -309,7 +311,7 @@ fn seal_seed_with_nonce(
     let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
         .expect("key length const-asserted");
     let aad = capsule_aad(fingerprint);
-    let nonce_ref = <&XNonce>::try_from(nonce.as_slice()).expect("nonce const-asserted");
+    let nonce_ref = <&XNonce>::from(nonce.as_slice());
     let ciphertext = seed
         .expose(|s| cipher.encrypt(nonce_ref, Payload { msg: s, aad: &aad }))
         .expect("encrypt seed");
@@ -343,7 +345,7 @@ fn unseal_seed(capsule: &SeedCapsule, sealing_key: &SealingKey) -> Result<Seed, 
     let aad = capsule_aad(fingerprint);
     let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
         .expect("key length const-asserted");
-    let nonce_ref = <&XNonce>::try_from(capsule.nonce.as_slice()).expect("nonce length checked");
+    let nonce_ref = <&XNonce>::from(capsule.nonce.as_slice());
     let mut plaintext = cipher
         .decrypt(
             nonce_ref,
@@ -687,7 +689,7 @@ mod tests {
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes()).unwrap();
         let nonce = [0x22; NONCE_LEN];
         let aad = capsule_aad(other);
-        let nonce_ref = <&XNonce>::try_from(nonce.as_slice()).unwrap();
+        let nonce_ref = <&XNonce>::from(nonce.as_slice());
         let ciphertext = seed
             .expose(|s| cipher.encrypt(nonce_ref, Payload { msg: s, aad: &aad }))
             .unwrap();

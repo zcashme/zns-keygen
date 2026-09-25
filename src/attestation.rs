@@ -40,7 +40,10 @@ pub struct Attestation {
     pub guest_policy: u64,
     /// Platform TCB at report time (components formatted for the manifest).
     pub tcb_version: String,
-    /// The report_data we supplied (kept for self-verification).
+    /// The report_data we supplied (kept for the sanity check).
+    ///
+    /// Unused on non-Linux, where `request` returns a stub report.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub report_data: [u8; REPORT_DATA_LEN],
 }
 
@@ -51,6 +54,9 @@ impl Attestation {
     ///
     /// Panics on mismatch — this is a one-shot ceremony tool, and a
     /// mismatched attestation is worse than no attestation.
+    ///
+    /// Called only on Linux, where a real PSP report is available.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn verify_report_data(&self) {
         let report = AttestationReport::from_bytes(&self.report_bytes)
             .expect("failed to parse attestation report for self-verification");
@@ -118,13 +124,13 @@ pub fn report_data(
 pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     #[cfg(not(target_os = "linux"))]
     {
-        return Attestation {
+        Attestation {
             report_bytes: Vec::new(),
             measurement: [0u8; 48],
             guest_policy: 0,
             tcb_version: "dev".into(),
             report_data: *requested_report_data,
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     {

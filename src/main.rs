@@ -53,8 +53,6 @@ const _: () = assert!(NONCE_LEN == 24);
 const _: () = assert!(TAG_LEN == 16);
 const _: () = assert!(CIPHERTEXT_LEN == SEED_LEN + TAG_LEN);
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-// compile_error!("zns-keygen requires x86_64 Linux");
 #[cfg(not(feature = "testnet"))]
 type Network = zcash_protocol::consensus::MainNetwork;
 #[cfg(not(feature = "testnet"))]

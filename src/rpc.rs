@@ -29,11 +29,12 @@ impl Rpc {
             .timeout(std::time::Duration::from_secs(10))
             .send_json(serde_json::to_value(&body).unwrap())
             .map_err(|e| format!("RPC transport: {e}"))?;
-        let parsed: RpcResp<R> = resp
-            .into_json()
-            .map_err(|e| format!("RPC decode: {e}"))?;
+        let parsed: RpcResp<R> = resp.into_json().map_err(|e| format!("RPC decode: {e}"))?;
         match parsed {
-            RpcResp { result: Some(r), error: None } => Ok(r),
+            RpcResp {
+                result: Some(r),
+                error: None,
+            } => Ok(r),
             RpcResp { error: Some(e), .. } => Err(format!("RPC error: {e}")),
             _ => Err("RPC returned null".into()),
         }
@@ -47,7 +48,10 @@ impl Rpc {
 
     /// UTXOs for a transparent address.
     pub fn address_utxos(addr: &str) -> Result<Vec<AddressUtxo>, String> {
-        Self::call("getaddressutxos", serde_json::json!([{"addresses": [addr]}]))
+        Self::call(
+            "getaddressutxos",
+            serde_json::json!([{"addresses": [addr]}]),
+        )
     }
 
     /// Broadcast raw tx hex.

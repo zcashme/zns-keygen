@@ -16,10 +16,10 @@
 //!      we write anything to disk.
 
 use blake2b_simd::Params as Blake2bParams;
-#[cfg(target_os = "linux")]
-use sev::firmware::guest::{AttestationReport, Firmware};
 #[cfg(not(target_os = "linux"))]
 use sev::firmware::guest::AttestationReport;
+#[cfg(target_os = "linux")]
+use sev::firmware::guest::{AttestationReport, Firmware};
 use sev::parser::ByteParser;
 
 use crate::fingerprint::SeedFingerprint;
@@ -33,7 +33,8 @@ use crate::{FINGERPRINT_LEN, REPORT_DATA_LEN};
 pub struct Attestation {
     /// Raw attestation report bytes (signed by the PSP, written to disk as-is).
     pub report_bytes: Vec<u8>,
-    /// VM launch measurement — hash of the guest's initial code (48 bytes, hex in manifest).
+    /// VM launch measurement. Commits to the measured guest launch state
+    /// (48 bytes, hex in manifest). It is not itself a hash of the `zns-keygen` binary.
     pub measurement: [u8; 48],
     /// Guest policy value (u64, hex in manifest).
     pub guest_policy: u64,
@@ -79,7 +80,10 @@ impl Attestation {
 ///
 /// Without this binding, an attacker could take a valid attestation from
 /// one ceremony and claim it was for a different capsule.
-pub fn report_data(fingerprint: &SeedFingerprint, capsule_hash: &[u8; 32]) -> [u8; REPORT_DATA_LEN] {
+pub fn report_data(
+    fingerprint: &SeedFingerprint,
+    capsule_hash: &[u8; 32],
+) -> [u8; REPORT_DATA_LEN] {
     let mut input = Vec::with_capacity(FINGERPRINT_LEN + 32);
     input.extend_from_slice(&fingerprint.to_bytes());
     input.extend_from_slice(capsule_hash);
@@ -99,14 +103,16 @@ pub fn report_data(fingerprint: &SeedFingerprint, capsule_hash: &[u8; 32]) -> [u
 ///
 /// The PSP is a separate secure processor on the AMD chip. It signs the
 /// attestation report with the VCEK (Versioned Chip Endorsement Key), an
-/// ECDSA-P256 key whose certificate chains to AMD's root CA.
+/// ECDSA P-384 key whose certificate chains to AMD's root CA. The guest does
+/// not receive the VCEK private key. The seed-sealing key is a separate
+/// SEV-SNP derived key, not the VCEK.
 ///
 /// To verify the report, a third party:
 /// 1. Parses the report to extract `chip_id` and `reported_tcb`
 /// 2. Fetches the VCEK cert from `https://kdsintf.amd.com/vcek/v1/...`
 /// 3. Verifies the ARK → ASK → VCEK certificate chain
-/// 4. Verifies the ECDSA-P256 signature on the report
-/// 5. Checks the measurement matches the expected `zns-keygen` binary
+/// 4. Verifies the ECDSA P-384 / SHA-384 signature on the report
+/// 5. Checks the measurement matches the expected measured guest launch state
 /// 6. Checks the `report_data` matches
 ///    `BLAKE2b-512(fingerprint ‖ capsule_hash)`
 pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
@@ -122,31 +128,31 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     }
     #[cfg(target_os = "linux")]
     {
-    let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
+        let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
 
-    let report_bytes = firmware
-        .get_report(None, Some(*requested_report_data), None)
-        .expect("failed to request SEV-SNP attestation report");
+        let report_bytes = firmware
+            .get_report(None, Some(*requested_report_data), None)
+            .expect("failed to request SEV-SNP attestation report");
 
-    // Parse the report to extract the fields the manifest needs.
-    let report = AttestationReport::from_bytes(&report_bytes)
-        .expect("failed to parse SEV-SNP attestation report");
+        // Parse the report to extract the fields the manifest needs.
+        let report = AttestationReport::from_bytes(&report_bytes)
+            .expect("failed to parse SEV-SNP attestation report");
 
-    let tcb = report.current_tcb;
-    let attestation = Attestation {
-        report_bytes,
-        measurement: report.measurement,
-        guest_policy: report.policy.into(),
-        tcb_version: format!(
-            "bootloader={} tee={} snp={} microcode={}",
-            tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
-        ),
-        report_data: *requested_report_data,
-    };
+        let tcb = report.current_tcb;
+        let attestation = Attestation {
+            report_bytes,
+            measurement: report.measurement,
+            guest_policy: report.policy.into(),
+            tcb_version: format!(
+                "bootloader={} tee={} snp={} microcode={}",
+                tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
+            ),
+            report_data: *requested_report_data,
+        };
 
-    // Self-verify before returning.
-    attestation.verify_report_data();
+        // Self-verify before returning.
+        attestation.verify_report_data();
 
-    attestation
+        attestation
     }
 }

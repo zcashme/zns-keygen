@@ -69,7 +69,63 @@ const NETWORK_LABEL: &str = "testnet";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+enum Command {
+    Help,
+    Run,
+}
+
 fn main() {
+    match command_from(std::env::args()) {
+        Ok(Command::Help) => println!("{}", usage()),
+        Ok(Command::Run) => run_ceremony(),
+        Err(message) => {
+            eprintln!("{message}\n\n{}", usage());
+            std::process::exit(2);
+        }
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "\
+zns-keygen — one-shot ZNS genesis custody ceremony ({NETWORK_LABEL})
+
+USAGE:
+    zns-keygen
+    zns-keygen --help
+
+With no arguments, generate a seed, seal it, wait for Treasury funding,
+and broadcast the genesis anchor transaction.
+
+The network is chosen at compile time. This binary is {NETWORK_LABEL}.
+
+OPTIONS:
+    -h, --help    Print this help and exit
+"
+    )
+}
+
+fn command_from<I, S>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next();
+    match args.next() {
+        None => Ok(Command::Run),
+        Some(arg) if matches!(arg.as_ref(), "-h" | "--help") => match args.next() {
+            None => Ok(Command::Help),
+            Some(extra) => Err(format!(
+                "unexpected argument after --help: {}",
+                extra.as_ref()
+            )),
+        },
+        Some(arg) => Err(format!("unrecognized argument: {}", arg.as_ref())),
+    }
+}
+
+fn run_ceremony() {
     tracing_subscriber::fmt().init();
     tracing::info!("=== ZNS KEY GENESIS ===");
     tracing::info!(network = NETWORK_LABEL, "starting ceremony");
@@ -587,6 +643,27 @@ fn sync_parent(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_does_not_select_the_ceremony() {
+        assert!(matches!(
+            command_from(["zns-keygen", "--help"]),
+            Ok(Command::Help)
+        ));
+        assert!(matches!(
+            command_from(["zns-keygen", "-h"]),
+            Ok(Command::Help)
+        ));
+        assert!(matches!(command_from(["zns-keygen"]), Ok(Command::Run)));
+        assert!(command_from(["zns-keygen", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn usage_names_help_and_the_compiled_network() {
+        let text = usage();
+        assert!(text.contains("--help"));
+        assert!(text.contains(NETWORK_LABEL));
+    }
 
     #[test]
     fn known_seed_matches_zip32_reference_vector() {

@@ -4,15 +4,15 @@ use orchard::builder::{Builder as OrchardBuilder, BundleType};
 use orchard::bundle::BundleVersion;
 use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
 use transparent::builder::{TransparentBuilder, TransparentInputInfo, TransparentSigningSet};
-use zcash_primitives::transaction::fees::zip317::FeeRule;
 use zcash_primitives::transaction::fees::FeeRule as _;
 use zcash_primitives::transaction::fees::transparent::InputView as _;
+use zcash_primitives::transaction::fees::zip317::FeeRule;
 use zcash_primitives::transaction::{
     self, Authorization, TransactionData,
     sighash::{SignableInput, signature_hash},
     txid::TxIdDigester,
 };
-use zcash_protocol::consensus::{BranchId, BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 
 use crate::keys::CeremonyKeys;
@@ -40,10 +40,7 @@ pub fn build_anchor_transaction<P: Parameters>(
     target_height: BlockHeight,
     inputs: &[TransparentInputInfo],
 ) -> zcash_primitives::transaction::Transaction {
-    let total_funded: u64 = inputs
-        .iter()
-        .map(|i| i.coin().value().into_u64())
-        .sum();
+    let total_funded: u64 = inputs.iter().map(|i| i.coin().value().into_u64()).sum();
     tracing::info!(total_funded, inputs = inputs.len(), "building anchor tx");
 
     let branch_id = BranchId::for_height(network, target_height);
@@ -67,7 +64,11 @@ pub fn build_anchor_transaction<P: Parameters>(
 
     let change = Zatoshis::const_from_u64(total_funded - fee.into_u64());
     assert!(change > Zatoshis::ZERO, "FATAL: no change after fees");
-    tracing::info!(anchors = NUM_ANCHORS, change = change.into_u64(), "economics");
+    tracing::info!(
+        anchors = NUM_ANCHORS,
+        change = change.into_u64(),
+        "economics"
+    );
 
     let registry_fvk = keys.registry_orchard_fvk();
     let treasury_fvk = keys.treasury_orchard_fvk();
@@ -77,13 +78,9 @@ pub fn build_anchor_transaction<P: Parameters>(
     let flags = bundle_version.default_flags();
     let anchor = orchard::Anchor::empty_tree();
 
-    let mut orchard_builder = OrchardBuilder::new(
-        BundleType::UNPADDED,
-        bundle_version,
-        flags,
-        anchor,
-    )
-    .expect("FATAL: orchard builder");
+    let mut orchard_builder =
+        OrchardBuilder::new(BundleType::UNPADDED, bundle_version, flags, anchor)
+            .expect("FATAL: orchard builder");
 
     let registry_addr = registry_fvk.address_at(0u32, orchard::keys::Scope::External);
     let registry_ovk = registry_fvk.to_ovk(orchard::keys::Scope::External);
@@ -146,8 +143,7 @@ pub fn build_anchor_transaction<P: Parameters>(
     let mut signing_set = TransparentSigningSet::new();
     let scope = transparent::keys::TransparentKeyScope::EXTERNAL;
     for _ in inputs {
-        let idx = transparent::keys::NonHardenedChildIndex::from_index(0)
-            .expect("FATAL: index");
+        let idx = transparent::keys::NonHardenedChildIndex::from_index(0).expect("FATAL: index");
         let sk = treasury_tkey
             .derive_secret_key(scope, idx)
             .expect("FATAL: transparent key");
@@ -160,12 +156,8 @@ pub fn build_anchor_transaction<P: Parameters>(
         .map(|b| {
             b.apply_signatures(
                 |input| {
-                    *signature_hash(
-                        unauthed_ref,
-                        &SignableInput::Transparent(input),
-                        txid_ref,
-                    )
-                    .as_ref()
+                    *signature_hash(unauthed_ref, &SignableInput::Transparent(input), txid_ref)
+                        .as_ref()
                 },
                 &signing_set,
             )
@@ -175,18 +167,14 @@ pub fn build_anchor_transaction<P: Parameters>(
 
     // ── 6. Create Ironwood proof + sign ─────────────────────────
     // Output-only bundle: all spends are dummies, auto-signed by prepare.
-    let shielded_sighash = signature_hash(
-        &unauthed_tx,
-        &SignableInput::Shielded,
-        &txid_parts,
-    );
+    let shielded_sighash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
 
     let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
 
     let authorized_ironwood = ironwood_bundle
         .create_proof(&pk, &mut rand::rngs::OsRng)
         .expect("FATAL: ironwood proof")
-        .prepare(&mut rand::rngs::OsRng, *shielded_sighash.as_ref())
+        .prepare(rand::rngs::OsRng, *shielded_sighash.as_ref())
         .finalize()
         .expect("FATAL: ironwood finalize");
 

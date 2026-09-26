@@ -7,8 +7,8 @@
 use core::{fmt, str::FromStr};
 
 use bech32::{
-    primitives::decode::{CheckedHrpstring, CheckedHrpstringError},
     Bech32m,
+    primitives::decode::{CheckedHrpstring, CheckedHrpstringError},
 };
 use blake2b_simd::Params as Blake2bParams;
 
@@ -72,6 +72,7 @@ impl SeedFingerprint {
     }
 
     /// Returns the fingerprint as a byte array.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
@@ -182,11 +183,9 @@ mod tests {
     #[test]
     fn wrong_hrp_rejected() {
         // A valid Bech32m string with a different HRP must be rejected.
-        let other = bech32::encode::<Bech32m>(
-            bech32::Hrp::parse_unchecked("notseedfp"),
-            &[0u8; 32],
-        )
-        .unwrap();
+        let other =
+            bech32::encode::<Bech32m>(bech32::Hrp::parse_unchecked("notseedfp"), &[0u8; 32])
+                .unwrap();
         assert!(matches!(
             SeedFingerprint::from_str(&other),
             Err(ParseError::NotASeedFingerprint)

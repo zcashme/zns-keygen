@@ -123,10 +123,24 @@ ZEBRA_PID=$!
 
 echo "zebrad pid: $ZEBRA_PID"
 
-# First prototype:
-#   boot -> persistent volumes -> network -> Zebra
-#
-# TODO: Health gating and automatic testnet keygen launch.
+echo "Waiting for Zebra health..."
+
+while true; do
+    if ! kill -0 "$ZEBRA_PID" 2>/dev/null; then
+        echo "FATAL: zebrad exited before becoming healthy"
+        wait "$ZEBRA_PID" || true
+        exec sh
+    fi
+
+    if wget -q -O /tmp/zebra-health http://127.0.0.1:8080/healthy; then
+        echo "Zebra healthy"
+        break
+    fi
+
+    sleep 2
+done
+
+# Zebra is healthy. Automatic testnet keygen launch comes next.
 wait "$ZEBRA_PID"
 
 echo "Zebra exited."

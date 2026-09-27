@@ -36,11 +36,21 @@ fi
 ZNS_UUID="0ece68d8-f963-4985-a751-84128c9ae1c4"
 ZEBRA_UUID="589fd35e-42f5-460c-aa84-7458ac3f11a0"
 
-echo "Mounting ZNS state..."
-mount -U "$ZNS_UUID" /state
+echo "Resolving persistent volumes..."
 
-echo "Mounting Zebra state..."
-mount -U "$ZEBRA_UUID" /var/lib/zebra
+ZNS_DEV="$(blkid -U "$ZNS_UUID")"
+ZEBRA_DEV="$(blkid -U "$ZEBRA_UUID")"
+
+if [ -z "$ZNS_DEV" ] || [ -z "$ZEBRA_DEV" ]; then
+    echo "FATAL: could not resolve persistent volume UUIDs"
+    exec sh
+fi
+
+echo "Mounting ZNS state from $ZNS_DEV..."
+mount "$ZNS_DEV" /state
+
+echo "Mounting Zebra state from $ZEBRA_DEV..."
+mount "$ZEBRA_DEV" /var/lib/zebra
 
 # ---------------------------------------------------------------------------
 # Networking

@@ -143,7 +143,24 @@ while true; do
     sleep 2
 done
 
-# Zebra is healthy. Automatic testnet keygen launch comes next.
+echo "Waiting for Zebra readiness..."
+
+while true; do
+    if ! kill -0 "$ZEBRA_PID" 2>/dev/null; then
+        echo "FATAL: zebrad exited before becoming ready"
+        wait "$ZEBRA_PID" || true
+        exec sh
+    fi
+
+    if wget -q -O /tmp/zebra-ready http://127.0.0.1:8080/ready; then
+        echo "Zebra ready"
+        break
+    fi
+
+    sleep 2
+done
+
+# Zebra is ready. TODO: Automatic testnet keygen launch.
 wait "$ZEBRA_PID"
 
 echo "Zebra exited."

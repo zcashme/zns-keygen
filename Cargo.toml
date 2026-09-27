@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 blake2b_simd = "1.0.4"
-sev = { version = "8.0.0", default-features = false, features = ["snp"] }
+sev = { version = "8.0.0", default-features = false, features = ["snp", "crypto_nossl"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 hex = "0.4.3"
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }

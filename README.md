@@ -154,11 +154,16 @@ state.
 
 ## Attestation
 
-`zns-keygen` requests a SEV-SNP attestation report from the AMD PSP and writes
-it to `zns_attestation.bin`. The report is sanity-checked before writing:
-`report_data` is compared with `BLAKE2b-512(seed_fingerprint || capsule_hash)`,
-and the measurement must not be all zeros. This does not verify the AMD VCEK
-signature or certificate chain.
+`zns-keygen` requests an extended SEV-SNP attestation report from the AMD PSP
+and writes it to `zns_attestation.bin`. Before writing, it verifies the report:
+
+- The report's signing-key field says VCEK. A VLEK, or a masked signature, is rejected.
+- The certificate table contains ARK, ASK, and VCEK certificates. A VLEK certificate is rejected.
+- The ASK verifies under a pinned AMD ARK for Milan, Genoa, or Turin. The ARK bytes supplied by the host are not the trust anchor.
+- That ASK signs the VCEK, and the VCEK's ECDSA P-384 / SHA-384 signature covers the report.
+- `report_data` matches `BLAKE2b-512(seed_fingerprint || capsule_hash)`, and the measurement is not all zeros.
+
+The AMD PSP records the launch measurement in the report. A verifier outside the guest, the host or anyone reading `zns_attestation.bin`, compares that value to the built image.
 
 The report signature algorithm is ECDSA P-384 / SHA-384.
 

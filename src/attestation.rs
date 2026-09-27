@@ -11,15 +11,18 @@
 //!      attestation report with that report_data embedded.
 //!   3. The returned `Attestation` struct carries the raw report bytes (for
 //!      writing to disk) plus the parsed fields the manifest needs.
-//!   4. `Attestation::verify_report_data()` — self-check that the PSP actually
-//!      embedded the report_data we requested, catching PSP garbage before
-//!      we write anything to disk.
+//!   4. `verify_vcek_report()` — require a VCEK signature under a pinned AMD
+//!      ARK. `Attestation::verify_report_data()` then checks `report_data` and
+//!      that the measurement is not zero. Both run before anything is written
+//!      to disk.
 
 use blake2b_simd::Params as Blake2bParams;
-#[cfg(not(target_os = "linux"))]
+use sev::certs::snp::ca::Chain as CaChain;
+use sev::certs::snp::{Certificate, Chain, Verifiable, builtin};
 use sev::firmware::guest::AttestationReport;
 #[cfg(target_os = "linux")]
-use sev::firmware::guest::{AttestationReport, Firmware};
+use sev::firmware::guest::Firmware;
+use sev::firmware::host::{CertTableEntry, CertType};
 use sev::parser::ByteParser;
 
 use crate::fingerprint::SeedFingerprint;
@@ -48,9 +51,10 @@ pub struct Attestation {
 }
 
 impl Attestation {
-    /// Self-verify that the report_data inside the attestation report
-    /// matches what we requested. This catches PSP garbage or a firmware
-    /// bug before we write anything to disk.
+    /// Check that the report embeds the `report_data` we requested and that
+    /// the launch measurement is not all zeros.
+    ///
+    /// This is not the AMD signature check. Call `verify_vcek_report` for that.
     ///
     /// Panics on mismatch — this is a one-shot ceremony tool, and a
     /// mismatched attestation is worse than no attestation.
@@ -113,14 +117,18 @@ pub fn report_data(
 /// not receive the VCEK private key. The seed-sealing key is a separate
 /// SEV-SNP derived key, not the VCEK.
 ///
-/// To verify the report, a third party:
-/// 1. Parses the report to extract `chip_id` and `reported_tcb`
-/// 2. Fetches the VCEK cert from `https://kdsintf.amd.com/vcek/v1/...`
-/// 3. Verifies the ARK → ASK → VCEK certificate chain
-/// 4. Verifies the ECDSA P-384 / SHA-384 signature on the report
-/// 5. Checks the measurement matches the expected measured guest launch state
-/// 6. Checks the `report_data` matches
-///    `BLAKE2b-512(fingerprint ‖ capsule_hash)`
+/// On Linux, `request` asks for the extended report, which includes the
+/// host-supplied certificate table. Before the report is returned:
+/// 1. The report must say it was signed by the VCEK, not the VLEK.
+/// 2. The table must contain ARK, ASK, and VCEK certificates. A VLEK is rejected.
+/// 3. The ASK must be signed by a pinned AMD ARK (Milan, Genoa, or Turin).
+/// 4. That ASK must sign the VCEK.
+/// 5. The VCEK's ECDSA P-384 / SHA-384 signature must cover the report.
+/// 6. `report_data` must match what we requested, and the measurement must
+///    not be all zeros.
+///
+/// The AMD PSP records the launch measurement. A verifier outside the guest
+/// compares it to the built image.
 pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     #[cfg(not(target_os = "linux"))]
     {
@@ -136,13 +144,15 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     {
         let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
 
-        let report_bytes = firmware
-            .get_report(None, Some(*requested_report_data), None)
-            .expect("failed to request SEV-SNP attestation report");
+        let (report_bytes, certs) = firmware
+            .get_ext_report(None, Some(*requested_report_data), None)
+            .expect("failed to request SEV-SNP extended attestation report");
+        let certs = certs.expect("FATAL: extended attestation report has no certificate table");
 
         // Parse the report to extract the fields the manifest needs.
         let report = AttestationReport::from_bytes(&report_bytes)
             .expect("failed to parse SEV-SNP attestation report");
+        verify_vcek_report(&report, &certs).expect("FATAL: attestation signature verification");
 
         let tcb = report.current_tcb;
         let attestation = Attestation {
@@ -156,9 +166,135 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
             report_data: *requested_report_data,
         };
 
-        // Self-verify before returning.
+        // report_data and measurement, after the signature check.
         attestation.verify_report_data();
 
         attestation
+    }
+}
+
+/// Verify that `report` was signed by a VCEK whose ASK chains to a pinned AMD ARK.
+///
+/// The certificate table is the one returned with the extended attestation
+/// report. Its ARK is not trusted by itself: the ASK must verify under the
+/// Milan, Genoa, or Turin ARK built into the `sev` crate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn verify_vcek_report(
+    report: &AttestationReport,
+    certs: &[CertTableEntry],
+) -> Result<(), String> {
+    if report.key_info.mask_chip_key() {
+        return Err("attestation report signature is masked".into());
+    }
+    if report.key_info.signing_key() != 0 {
+        return Err("attestation report was not signed by the VCEK".into());
+    }
+    if certs.iter().any(|entry| entry.cert_type == CertType::VLEK) {
+        return Err("VLEK certificates are not accepted".into());
+    }
+
+    let ask = one_cert(certs, CertType::ASK)?;
+    let vcek = one_cert(certs, CertType::VCEK)?;
+    // Present so the extended report actually carried a root, then ignored
+    // in favor of the pinned AMD copy.
+    let _table_ark = one_cert(certs, CertType::ARK)?;
+
+    let chain = chain_under_pinned_ark(ask, vcek)?;
+    (&chain, report)
+        .verify()
+        .map_err(|e| format!("VCEK signature verification failed: {e}"))?;
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn one_cert(certs: &[CertTableEntry], kind: CertType) -> Result<Certificate, String> {
+    let mut found = None;
+    for entry in certs {
+        if entry.cert_type != kind {
+            continue;
+        }
+        if found.is_some() {
+            return Err(format!("more than one {kind:?} certificate"));
+        }
+        found = Some(
+            Certificate::from_der(&entry.data)
+                .map_err(|e| format!("invalid {kind:?} certificate: {e}"))?,
+        );
+    }
+    found.ok_or_else(|| format!("{kind:?} certificate missing"))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn chain_under_pinned_ark(ask: Certificate, vcek: Certificate) -> Result<Chain, String> {
+    let roots = [
+        builtin::milan::ark(),
+        builtin::genoa::ark(),
+        builtin::turin::ark(),
+    ];
+    for root in roots {
+        let ark = root.map_err(|e| format!("pinned AMD ARK: {e}"))?;
+        let chain = Chain {
+            ca: CaChain {
+                ark,
+                ask: ask.clone(),
+            },
+            vek: vcek.clone(),
+        };
+        if chain.verify().is_ok() {
+            return Ok(chain);
+        }
+    }
+    Err("ASK is not signed by a pinned AMD ARK (Milan, Genoa, or Turin)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MILAN_VCEK_DER: &[u8] = include_bytes!("testdata/vcek_milan.der");
+    const MILAN_REPORT_HEX: &[u8] = include_bytes!("testdata/report_milan.hex");
+
+    fn milan_certs() -> Vec<CertTableEntry> {
+        let ark = builtin::milan::ark().unwrap().to_der().unwrap();
+        let ask = builtin::milan::ask().unwrap().to_der().unwrap();
+        vec![
+            CertTableEntry::new(CertType::ARK, ark),
+            CertTableEntry::new(CertType::ASK, ask),
+            CertTableEntry::new(CertType::VCEK, MILAN_VCEK_DER.to_vec()),
+        ]
+    }
+
+    fn milan_report() -> AttestationReport {
+        let bytes = hex::decode(MILAN_REPORT_HEX).unwrap();
+        AttestationReport::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn milan_vcek_report_verifies() {
+        verify_vcek_report(&milan_report(), &milan_certs()).unwrap();
+    }
+
+    #[test]
+    fn modified_report_fails_vcek_signature() {
+        let mut bytes = hex::decode(MILAN_REPORT_HEX).unwrap();
+        bytes[21] ^= 0x80;
+        let report = AttestationReport::from_bytes(&bytes).unwrap();
+        assert!(verify_vcek_report(&report, &milan_certs()).is_err());
+    }
+
+    #[test]
+    fn vlek_certificate_is_rejected() {
+        let mut certs = milan_certs();
+        certs.push(CertTableEntry::new(CertType::VLEK, MILAN_VCEK_DER.to_vec()));
+        assert!(verify_vcek_report(&milan_report(), &certs).is_err());
+    }
+
+    #[test]
+    fn missing_vcek_is_rejected() {
+        let certs: Vec<_> = milan_certs()
+            .into_iter()
+            .filter(|entry| entry.cert_type != CertType::VCEK)
+            .collect();
+        assert!(verify_vcek_report(&milan_report(), &certs).is_err());
     }
 }

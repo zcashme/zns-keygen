@@ -56,6 +56,9 @@ mount "$ZEBRA_DEV" /var/lib/zebra
 # Networking
 # ---------------------------------------------------------------------------
 
+echo "Bringing up loopback..."
+ip link set lo up
+
 NIC=""
 
 for iface in /sys/class/net/*; do

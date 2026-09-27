@@ -12,8 +12,9 @@
 //!   3. The returned `Attestation` struct carries the raw report bytes (for
 //!      writing to disk) plus the parsed fields the manifest needs.
 //!   4. `verify_vcek_report()` — require a VCEK signature under a pinned AMD
-//!      ARK, then check `report_data` and that the measurement is not zero.
-//!      This runs before anything is written to disk.
+//!      ARK. `Attestation::verify_report_data()` then checks `report_data` and
+//!      that the measurement is not zero. Both run before anything is written
+//!      to disk.
 
 use blake2b_simd::Params as Blake2bParams;
 use sev::certs::snp::ca::Chain as CaChain;
@@ -213,14 +214,14 @@ fn one_cert(certs: &[CertTableEntry], kind: CertType) -> Result<Certificate, Str
             continue;
         }
         if found.is_some() {
-            return Err(format!("more than one {kind} certificate"));
+            return Err(format!("more than one {kind:?} certificate"));
         }
         found = Some(
             Certificate::from_der(&entry.data)
-                .map_err(|e| format!("invalid {kind} certificate: {e}"))?,
+                .map_err(|e| format!("invalid {kind:?} certificate: {e}"))?,
         );
     }
-    found.ok_or_else(|| format!("{kind} certificate missing"))
+    found.ok_or_else(|| format!("{kind:?} certificate missing"))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

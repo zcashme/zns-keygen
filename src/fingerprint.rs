@@ -47,7 +47,7 @@ impl SeedFingerprint {
         let seed_len = seed_bytes.len();
 
         if (32..=252).contains(&seed_len) {
-            let seed_len: u8 = seed_len.try_into().unwrap();
+            let seed_len: u8 = seed_len.try_into().expect("seed length fits u8");
             Some(SeedFingerprint(
                 Blake2bParams::new()
                     .hash_length(32)

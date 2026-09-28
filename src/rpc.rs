@@ -27,7 +27,7 @@ impl Rpc {
         let resp = ureq::post(RPC_URL)
             .set("content-type", "application/json")
             .timeout(std::time::Duration::from_secs(10))
-            .send_json(serde_json::to_value(&body).unwrap())
+            .send_json(serde_json::to_value(&body).expect("FATAL: encode RPC request"))
             .map_err(|e| format!("RPC transport: {e}"))?;
         let parsed: RpcResp<R> = resp.into_json().map_err(|e| format!("RPC decode: {e}"))?;
         match parsed {

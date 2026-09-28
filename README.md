@@ -58,8 +58,10 @@ When the ceremony runs, `zns-keygen`:
    persisted as `keys/zns_attestation.bin`. This happens before funding and
    before any on-chain action. The state then becomes `WAITING_FOR_FUNDS`.
 9. Displays the Treasury transparent funding address and waits for funding
-   through Zebra. The seed does not remain in plaintext memory during this
-   operator-controlled wait. Observed funding is recorded as `FUNDED`.
+   through Zebra. An empty address logs `no funding yet`. A failed Zebra query
+   is logged and retried; it is not treated as an empty address. The seed does
+   not remain in plaintext memory during this operator-controlled wait.
+   Observed funding is recorded as `FUNDED`.
 10. Unseals the capsule, derives the Treasury external index-0 signing key and
     the Treasury and Registry Orchard full viewing keys, builds and signs the
     genesis anchor, and persists that exact transaction as `ANCHOR_BUILT`

@@ -29,7 +29,7 @@ impl TreasuryFundingInfo {
             let pubkey = account_pub
                 .derive_address_pubkey(
                     TransparentKeyScope::EXTERNAL,
-                    NonHardenedChildIndex::from_index(0).unwrap(),
+                    NonHardenedChildIndex::from_index(0).expect("FATAL: index 0"),
                 )
                 .expect("FATAL: pubkey derivation");
             (address, pubkey)
@@ -84,7 +84,7 @@ impl AnchorMaterial {
             account
                 .derive_secret_key(
                     TransparentKeyScope::EXTERNAL,
-                    NonHardenedChildIndex::from_index(0).expect("index 0"),
+                    NonHardenedChildIndex::from_index(0).expect("FATAL: index 0"),
                 )
                 .expect("FATAL: transparent key")
         };
@@ -103,7 +103,7 @@ fn treasury_account_key<P: Parameters>(
     transparent::keys::AccountPrivKey::from_seed(
         network,
         seed,
-        AccountId::try_from(TREASURY_ACCOUNT).unwrap(),
+        AccountId::try_from(TREASURY_ACCOUNT).expect("FATAL: Treasury account id"),
     )
     .expect("FATAL: Treasury key derivation")
 }
@@ -116,7 +116,7 @@ fn orchard_fvk<P: Parameters>(
     let sk = orchard::keys::SpendingKey::from_zip32_seed(
         seed,
         network.coin_type(),
-        AccountId::try_from(account).unwrap(),
+        AccountId::try_from(account).expect("FATAL: Orchard account id"),
     )
     .expect("FATAL: Orchard key derivation");
     (&sk).into()

@@ -58,6 +58,43 @@ impl Rpc {
     pub fn send_raw(hex: &str) -> Result<String, String> {
         Self::call("sendrawtransaction", serde_json::json!([hex]))
     }
+
+    /// Whether `txid` is already in the mempool or chain.
+    ///
+    /// A missing-transaction RPC error is `Absent`. Any other failure is
+    /// returned so the caller does not broadcast when the node cannot be asked.
+    pub fn transaction_presence(txid: &str) -> Result<TxLookup, String> {
+        match Self::call::<_, _, serde_json::Value>(
+            "getrawtransaction",
+            serde_json::json!([txid, 1]),
+        ) {
+            Ok(value) => {
+                let height = value
+                    .get("height")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|height| u32::try_from(height).unwrap_or(u32::MAX));
+                Ok(TxLookup::Present { height })
+            }
+            Err(message) if transaction_is_absent(&message) => Ok(TxLookup::Absent),
+            Err(message) => Err(message),
+        }
+    }
+}
+
+/// Result of looking up one transaction id.
+pub enum TxLookup {
+    Absent,
+    Present { height: Option<u32> },
+}
+
+/// True only for the RPC error Zebra and zcashd use when a txid is unknown.
+///
+/// Other failures, including a missing RPC method, must not look like absence.
+pub(crate) fn transaction_is_absent(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("no such mempool")
+        || lower.contains("no such transaction")
+        || lower.contains("no information available about transaction")
 }
 
 #[derive(Deserialize)]
@@ -92,4 +129,24 @@ pub struct AddressUtxo {
     pub output_index: u32,
     pub satoshis: u64,
     pub script: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transaction_is_absent;
+
+    #[test]
+    fn only_a_missing_transaction_counts_as_absent() {
+        assert!(transaction_is_absent(
+            "RPC error: No such mempool or blockchain transaction"
+        ));
+        assert!(transaction_is_absent(
+            "RPC error: No information available about transaction"
+        ));
+        assert!(!transaction_is_absent("RPC error: Method not found"));
+        assert!(!transaction_is_absent("RPC transport: connection refused"));
+        assert!(!transaction_is_absent(
+            "RPC error: transaction already in block chain"
+        ));
+    }
 }

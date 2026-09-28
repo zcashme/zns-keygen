@@ -44,6 +44,16 @@ impl TreasuryFundingInfo {
     pub fn pubkey(&self) -> secp256k1::PublicKey {
         self.pubkey
     }
+
+    /// Restore the public funding record from a persisted ceremony state.
+    ///
+    /// The address and pubkey are public. This does not derive or unseal a seed.
+    pub(crate) fn from_public(
+        address: transparent::address::TransparentAddress,
+        pubkey: secp256k1::PublicKey,
+    ) -> Self {
+        Self { address, pubkey }
+    }
 }
 
 /// Key material the anchor transaction actually uses.

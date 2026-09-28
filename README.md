@@ -35,8 +35,10 @@ The network is chosen at compile time (`--features testnet` selects testnet). Th
 
 When the ceremony runs, `zns-keygen`:
 
-1. Refuses to run if `keys/zns_seed.capsule`, `keys/zns_custody_manifest.toml`,
-   `keys/zns_mint.conf`, or `keys/zns_attestation.bin` already exists.
+1. Resumes from `keys/ceremony_state.toml` when that file and the capsule are
+   both present. If the capsule exists without ceremony state, it refuses and
+   leaves the capsule in place. A new ceremony also refuses to start when the
+   manifest, mint config, or attestation file already exists.
 2. Generates a fresh 32-byte seed using `RDSEED`.
 3. Computes the ZIP-32 seed fingerprint locally:
    `BLAKE2b-256(personal="Zcash_HD_Seed_FP", [seed_len] || seed)`, displayed as
@@ -48,35 +50,52 @@ When the ceremony runs, `zns-keygen`:
 6. Immediately encrypts the seed with `XChaCha20Poly1305`, binding the capsule
    magic and seed fingerprint into the AAD (Additional Authenticated Data).
 7. Persists `keys/zns_seed.capsule` (postcard-serialized struct: magic + fingerprint
-   + nonce + ciphertext+tag) and drops the plaintext seed and any derived
-   private spending-key material.
-8. Displays the Treasury transparent funding address and waits for funding
+   + nonce + ciphertext+tag), records `SEALED` in `keys/ceremony_state.toml`
+   with the Treasury address and public key, and drops the plaintext seed.
+8. Requests a SEV-SNP attestation bound to
+   `BLAKE2b-512(seed_fingerprint ‖ capsule_hash)`. The VCEK and ASK are fetched
+   from AMD KDS and checked against a pinned AMD ARK. The verified report is
+   persisted as `keys/zns_attestation.bin`. This happens before funding and
+   before any on-chain action. The state then becomes `WAITING_FOR_FUNDS`.
+9. Displays the Treasury transparent funding address and waits for funding
    through Zebra. The seed does not remain in plaintext memory during this
-   operator-controlled wait.
-9. Once sufficient funding is detected, derives the SEV-SNP sealing key again,
-   decrypts the capsule, verifies the seed fingerprint, derives the Treasury
-   external index-0 signing key and the Treasury and Registry Orchard full
-   viewing keys, builds and signs the genesis anchor transaction, broadcasts it
-   through Zebra, and drops the plaintext seed and private key material again.
-10. Writes `keys/zns_custody_manifest.toml`, `keys/zns_mint.conf`, and
-    `keys/zns_attestation.bin`, then exits.
+   operator-controlled wait. Observed funding is recorded as `FUNDED`.
+10. Unseals the capsule, derives the Treasury external index-0 signing key and
+    the Treasury and Registry Orchard full viewing keys, builds and signs the
+    genesis anchor, and persists that exact transaction as `ANCHOR_BUILT`
+    before broadcasting it. The plaintext seed and signing key are dropped
+    before the transaction is stored.
+11. Asks Zebra whether that txid is already known. If it is not, broadcasts the
+    stored transaction. If it is, does not build or broadcast another. Either
+    way, immediately persists `ANCHOR_BROADCAST` with the txid and birthday.
+12. Writes `keys/zns_custody_manifest.toml` and `keys/zns_mint.conf`, records
+    `COMPLETE`, and exits.
 
 The ordering is:
 
-`generate seed → derive public funding information → immediately seal seed → discard plaintext → wait for funding → temporarily unseal to sign the genesis transaction → discard plaintext again`
+`generate seed → seal capsule → request and verify attestation → persist attestation → wait for funding → unseal → build, sign, and persist the anchor → broadcast → persist txid and birthday → write manifest and mint config → complete`
+
+Restart continues from the persisted state:
+
+- `SEALED` requests and verifies attestation when it is not already stored, then waits for funding.
+- `WAITING_FOR_FUNDS` resumes the funding wait.
+- `FUNDED` constructs the anchor.
+- `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it.
+- `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction.
+- `COMPLETE` exits successfully.
 
 The capsule is the authoritative copy of the ceremony seed the moment it is
-durably written, which is before the funding wait. There is no resume path.
-If the process dies after that write and before the anchor transaction is
-broadcast, restarting is refused because the capsule already exists. Deleting
-the capsule and re-running generates a different seed and abandons the sealed
-one; that is not recovery. This tool does not implement migration or recovery.
+durably written, which is before attestation and before the funding wait.
+Deleting the capsule and re-running generates a different seed and abandons
+the sealed one; that is not recovery. A capsule written before ceremony state
+existed cannot be resumed. This tool does not implement migration or recovery.
 That support is planned future work and remains in scope for v1.
 
 Defaults:
 
 ```text
 capsule:      keys/zns_seed.capsule
+state:        keys/ceremony_state.toml
 manifest:     keys/zns_custody_manifest.toml
 mint_config:  keys/zns_mint.conf
 attestation:  keys/zns_attestation.bin
@@ -158,14 +177,19 @@ state.
 
 ## Attestation
 
-`zns-keygen` requests an extended SEV-SNP attestation report from the AMD PSP
-and writes it to `keys/zns_attestation.bin`. Before writing, it verifies the report:
+`zns-keygen` requests a SEV-SNP attestation report from the AMD PSP and writes
+it to `keys/zns_attestation.bin` after the capsule is sealed and before it
+waits for funding. The report is the VCEK-signed evidence. The VCEK, and the
+ASK that certifies it, are fetched from AMD's Key Distribution Service
+(`kdsintf.amd.com`). The guest does not depend on the host certificate table.
+Before writing, it verifies the report:
 
 - The report's signing-key field says VCEK. A VLEK, or a masked signature, is rejected.
-- The certificate table contains ARK, ASK, and VCEK certificates. A VLEK certificate is rejected.
-- The ASK verifies under a pinned AMD ARK for Milan, Genoa, or Turin. The ARK bytes supplied by the host are not the trust anchor.
+- The ASK fetched from AMD verifies under a pinned AMD ARK for Milan, Genoa, or Turin. The ARK bytes served by KDS are not the trust anchor.
 - That ASK signs the VCEK, and the VCEK's ECDSA P-384 / SHA-384 signature covers the report.
 - `report_data` matches `BLAKE2b-512(seed_fingerprint || capsule_hash)`, and the measurement is not all zeros.
+
+A later resume reads `keys/zns_attestation.bin` and repeats that check: it fetches the VCEK and ASK again, verifies the signature, and only then copies the measurement and guest policy into the custody manifest.
 
 The AMD PSP records the launch measurement in the report. A verifier outside the guest, the host or anyone reading `keys/zns_attestation.bin`, compares that value to the built image.
 
@@ -173,7 +197,9 @@ The report signature algorithm is ECDSA P-384 / SHA-384.
 
 The attestation report and custody manifest are written with mode `0644`
 (world-readable) so third-party verification tools can read them without
-root. The capsule and mint config are written with mode `0600` (owner only).
+root. The capsule, ceremony state, and mint config are written with mode
+`0600` (owner only). Ceremony state holds the Treasury address and, once the
+anchor exists, the signed transaction, txid, and birthday.
 
 ## Entropy
 

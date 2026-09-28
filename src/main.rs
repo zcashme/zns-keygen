@@ -25,8 +25,7 @@ use zcash_protocol::value::Zatoshis;
 use zeroize::{Zeroize, Zeroizing};
 
 use fingerprint::SeedFingerprint;
-use keys::{CeremonyKeys, TreasuryFundingInfo};
-use secrecy::Secret;
+use keys::{AnchorMaterial, TreasuryFundingInfo};
 
 const KEYS_DIR: &str = "keys";
 const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
@@ -182,19 +181,26 @@ fn run_ceremony() {
             fingerprint,
             "FATAL: unsealed seed fingerprint does not match the ceremony fingerprint"
         );
-        let keys = seed.expose(|seed_bytes| {
-            let secret = Secret::new(*seed_bytes);
-            CeremonyKeys::derive(&NETWORK, &secret)
-        });
-        drop(seed);
-        drop(sealing_key);
-
         {
             tracing::info!("=== ANCHOR CREATION ===");
             let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
             tracing::info!(height = u32::from(tip_height), "chain tip");
 
-            let tx = anchor::build_anchor_transaction(&NETWORK, &keys, tip_height, &inputs);
+            let mut material =
+                seed.expose(|seed_bytes| AnchorMaterial::derive(&NETWORK, seed_bytes));
+            drop(seed);
+            drop(sealing_key);
+
+            let tx = anchor::build_anchor_transaction(
+                &NETWORK,
+                &mut material.treasury_signing_key,
+                &material.treasury_orchard_fvk,
+                &material.registry_orchard_fvk,
+                tip_height,
+                &inputs,
+            );
+            drop(material);
+
             let mut tx_bytes = Vec::new();
             tx.write(&mut tx_bytes).expect("FATAL: serialize tx");
             let tx_hex = hex::encode(&tx_bytes);
@@ -239,7 +245,7 @@ fn run_ceremony() {
 
 /// Poll Zebra until the Treasury address is funded.
 ///
-/// Takes only the public funding address and pubkey. `CeremonyKeys` is not
+/// Takes only the public funding address and pubkey. Spending keys are not
 /// in scope for this wait.
 fn poll_until_funded(
     funding: &TreasuryFundingInfo,

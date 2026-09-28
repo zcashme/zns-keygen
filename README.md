@@ -2,20 +2,22 @@
 
 `zns-keygen` is the one-shot genesis custody tool for ZNS.
 
-It must be run once inside the chosen AMD SEV-SNP instance. It creates the ZNS
-issuer seed, seals it to that specific instance, writes a binary capsule, emits
-a public custody manifest, and exits. It does not expose a socket, does not
-sign messages, and does not support migration.
+It must be run once inside a compatible measured SEV-SNP guest. It creates the
+ZNS issuer seed, seals it to the SEV-SNP platform and selected measured guest
+context, writes a binary capsule, emits a public custody manifest, and exits.
+It does not expose a socket and does not sign messages. It does not support
+migration. Migration and recovery are planned future work and remain in scope
+for v1. The seed is not permanently bound to one binary and one machine.
 
 ## Role in the ZNS custody architecture
 
 ZNS custody is split across two components that run inside the same measured
 SEV-SNP guest:
 
-| Component   | Responsibility                                      | Seed access       |
-|-------------|----------------------------------------------------|-------------------|
-| `zns-keygen`| Create the seed once, seal it, emit a manifest.     | Create-only, then exit. |
-| `zns-mint`  | Unseal the capsule at boot, use the seed to mint.   | Use-only.         |
+| Component    | Responsibility                                    | Seed access                       |
+|--------------|---------------------------------------------------|-----------------------------------|
+| `zns-keygen` | Create seed, seal it, sign genesis once.          | Create + one-time use, then exit. |
+| `zns-mint`   | Unseal the capsule at boot, use the seed to mint. | Use-only.                         |
 
 `zns-keygen` exists so that `zns-mint` never has to contain seed-creation
 logic. The mint only ever consumes a capsule that `zns-keygen` produced.
@@ -33,8 +35,8 @@ The network is chosen at compile time (`--features testnet` selects testnet). Th
 
 When the ceremony runs, `zns-keygen`:
 
-1. Refuses to run if `zns_seed.capsule`, `zns_custody_manifest.toml`,
-   `zns_mint.conf`, or `zns_attestation.bin` already exists.
+1. Refuses to run if `keys/zns_seed.capsule`, `keys/zns_custody_manifest.toml`,
+   `keys/zns_mint.conf`, or `keys/zns_attestation.bin` already exists.
 2. Generates a fresh 32-byte seed using `RDSEED`.
 3. Computes the ZIP-32 seed fingerprint locally:
    `BLAKE2b-256(personal="Zcash_HD_Seed_FP", [seed_len] || seed)`, displayed as
@@ -45,7 +47,7 @@ When the ceremony runs, `zns-keygen`:
    hierarchy, bound to guest policy and measurement.
 6. Immediately encrypts the seed with `XChaCha20Poly1305`, binding the capsule
    magic and seed fingerprint into the AAD (Additional Authenticated Data).
-7. Persists `zns_seed.capsule` (postcard-serialized struct: magic + fingerprint
+7. Persists `keys/zns_seed.capsule` (postcard-serialized struct: magic + fingerprint
    + nonce + ciphertext+tag) and drops the plaintext seed and any derived
    private spending-key material.
 8. Displays the Treasury transparent funding address and waits for funding
@@ -53,11 +55,11 @@ When the ceremony runs, `zns-keygen`:
    operator-controlled wait.
 9. Once sufficient funding is detected, derives the SEV-SNP sealing key again,
    decrypts the capsule, verifies the seed fingerprint, derives the Treasury
-   and Registry spending keys, builds and signs the genesis anchor transaction,
-   broadcasts it through Zebra, and drops the plaintext seed and private key
-   material again.
-10. Writes `zns_custody_manifest.toml`, `zns_mint.conf`, and
-    `zns_attestation.bin`, then exits.
+   external index-0 signing key and the Treasury and Registry Orchard full
+   viewing keys, builds and signs the genesis anchor transaction, broadcasts it
+   through Zebra, and drops the plaintext seed and private key material again.
+10. Writes `keys/zns_custody_manifest.toml`, `keys/zns_mint.conf`, and
+    `keys/zns_attestation.bin`, then exits.
 
 The ordering is:
 
@@ -68,14 +70,16 @@ durably written, which is before the funding wait. There is no resume path.
 If the process dies after that write and before the anchor transaction is
 broadcast, restarting is refused because the capsule already exists. Deleting
 the capsule and re-running generates a different seed and abandons the sealed
-one; that is not recovery. Migration and recovery policy are out of scope.
+one; that is not recovery. This tool does not implement migration or recovery.
+That support is planned future work and remains in scope for v1.
 
 Defaults:
 
 ```text
-capsule:      zns_seed.capsule
-manifest:     zns_custody_manifest.toml
-mint_config:  zns_mint.conf
+capsule:      keys/zns_seed.capsule
+manifest:     keys/zns_custody_manifest.toml
+mint_config:  keys/zns_mint.conf
+attestation:  keys/zns_attestation.bin
 ```
 
 ## Capsule format
@@ -97,7 +101,7 @@ also published in the manifest.
 
 ## Mint config
 
-`zns_mint.conf` is a TOML file written by `zns-keygen` containing:
+`keys/zns_mint.conf` is a TOML file written by `zns-keygen` containing:
 
 ```toml
 network = "mainnet"
@@ -121,9 +125,9 @@ capsule or swapping ciphertext between capsules is detected:
 
 The encryption key is an SEV-SNP derived sealing key rooted in the AMD
 platform's SNP key hierarchy. The guest does not receive the VCEK private key.
-Derivation selects guest policy and measurement. A different CPU, guest
-policy, or launch measurement cannot recreate the key, so a capsule sealed in
-one guest cannot be decrypted in another.
+Derivation selects guest policy and measurement. The capsule is sealed to the
+SEV-SNP platform and that selected measured guest context. A different CPU,
+guest policy, or launch measurement cannot recreate the key.
 
 ## Custody Manifest
 
@@ -155,7 +159,7 @@ state.
 ## Attestation
 
 `zns-keygen` requests an extended SEV-SNP attestation report from the AMD PSP
-and writes it to `zns_attestation.bin`. Before writing, it verifies the report:
+and writes it to `keys/zns_attestation.bin`. Before writing, it verifies the report:
 
 - The report's signing-key field says VCEK. A VLEK, or a masked signature, is rejected.
 - The certificate table contains ARK, ASK, and VCEK certificates. A VLEK certificate is rejected.
@@ -163,7 +167,7 @@ and writes it to `zns_attestation.bin`. Before writing, it verifies the report:
 - That ASK signs the VCEK, and the VCEK's ECDSA P-384 / SHA-384 signature covers the report.
 - `report_data` matches `BLAKE2b-512(seed_fingerprint || capsule_hash)`, and the measurement is not all zeros.
 
-The AMD PSP records the launch measurement in the report. A verifier outside the guest, the host or anyone reading `zns_attestation.bin`, compares that value to the built image.
+The AMD PSP records the launch measurement in the report. A verifier outside the guest, the host or anyone reading `keys/zns_attestation.bin`, compares that value to the built image.
 
 The report signature algorithm is ECDSA P-384 / SHA-384.
 
@@ -195,9 +199,14 @@ zeros or all 0xFF) are rejected.
   fingerprint. Platform binding comes from the SEV-SNP derived key, which is
   unique per physical CPU and selected guest fields.
 - **Plaintext seed during the funding wait.** The seed is sealed and dropped
-  before `zns-keygen` waits for the operator's funding transaction. Spending
-  keys are derived again only after funding arrives, and dropped again after
-  the anchor transaction is broadcast.
+  before `zns-keygen` waits for the operator's funding transaction. After
+  funding, the Treasury account private key is dropped as soon as the external
+  index-0 signing key is derived. That signing key is erased after it signs,
+  and the anchor material is dropped before the transaction is serialized.
+  Upstream Treasury account and Orchard spending-key types do not support
+  in-place zeroization; their lifetimes are therefore minimized to the
+  derivation scope, but dropped copies may leave residual bytes in guest
+  memory until that memory is reused or the VM is destroyed.
 - **Accidental re-run.** `zns-keygen` refuses to overwrite an existing capsule
   or manifest.
 
@@ -211,9 +220,10 @@ zeros or all 0xFF) are rejected.
   still has access to the SEV-SNP derived-key interface, they can request the
   same key. The measurement binding mitigates this only if the capsule is
   sealed to a measurement that the attacker's image does not match.
-- **Memory inspection after decrypt.** Once `zns-mint` decrypts the seed into
-  process memory, guest root can read it via `/proc/$pid/mem`, ptrace, core
-  dumps, or by replacing the mint binary itself.
+- **Memory inspection after decrypt.** Once either `zns-keygen` or `zns-mint`
+  decrypts the seed into process memory, guest root can inspect it during that
+  live window via `/proc/$pid/mem`, ptrace, core dumps, or by replacing the
+  binary itself.
 
 ### Threat model summary
 
@@ -232,6 +242,7 @@ key release, or an external HSM/MPC signer. These are future work.
 
 ### Liveness
 
-This intentionally accepts liveness risk: there is no migration path in v1. If
-the chosen SEV-SNP instance is lost, the v1 capsule is lost and the seed is
-unrecoverable.
+This tool has no migration path. If the current SEV-SNP platform or measured
+guest context is lost, the capsule cannot be unsealed until migration and
+recovery exist. Those are planned v1 work, because the seed cannot be
+permanently bound to one binary and one machine.

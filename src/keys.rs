@@ -1,9 +1,7 @@
 //! Key derivation from seed.
 
-use secrecy::{ExposeSecret, Secret};
 use transparent::keys::{IncomingViewingKey, NonHardenedChildIndex, TransparentKeyScope};
-use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::Parameters;
+use zcash_protocol::consensus::{NetworkConstants, Parameters};
 
 use crate::{REGISTRY_ACCOUNT, TREASURY_ACCOUNT};
 use zip32::AccountId;
@@ -19,15 +17,10 @@ impl TreasuryFundingInfo {
     /// Derive only the Treasury transparent address and external pubkey.
     ///
     /// The account private key is dropped before this returns. Callers must
-    /// not retain a `CeremonyKeys` value across the funding wait.
+    /// not retain spending-key material across the funding wait.
     pub fn derive<P: Parameters>(network: &P, seed: &[u8; 32]) -> Self {
         let (address, pubkey) = {
-            let privkey = transparent::keys::AccountPrivKey::from_seed(
-                network,
-                seed,
-                AccountId::try_from(TREASURY_ACCOUNT).unwrap(),
-            )
-            .expect("FATAL: Treasury key derivation");
+            let privkey = treasury_account_key(network, seed);
             let account_pub = privkey.to_account_pubkey();
             let external_ivk = account_pub
                 .derive_external_ivk()
@@ -53,74 +46,74 @@ impl TreasuryFundingInfo {
     }
 }
 
-/// Both accounts' spending keys. Construct only for the anchor-signing phase.
-pub struct CeremonyKeys {
-    treasury: UnifiedSpendingKey,
-    registry: UnifiedSpendingKey,
+/// Key material the anchor transaction actually uses.
+///
+/// The only transparent private key here is the external index-0 child. The
+/// Treasury account private key is dropped as soon as that child is derived.
+/// Sapling is not derived.
+pub struct AnchorMaterial {
+    pub treasury_signing_key: secp256k1::SecretKey,
+    pub treasury_orchard_fvk: orchard::keys::FullViewingKey,
+    pub registry_orchard_fvk: orchard::keys::FullViewingKey,
 }
 
-impl CeremonyKeys {
-    /// Derive both accounts.
-    pub fn derive<P: Parameters>(network: &P, seed: &Secret<[u8; 32]>) -> Self {
-        let treasury = UnifiedSpendingKey::from_seed(
-            network,
-            seed.expose_secret(),
-            AccountId::try_from(TREASURY_ACCOUNT).unwrap(),
-        )
-        .expect("FATAL: Treasury key derivation");
-        let registry = UnifiedSpendingKey::from_seed(
-            network,
-            seed.expose_secret(),
-            AccountId::try_from(REGISTRY_ACCOUNT).unwrap(),
-        )
-        .expect("FATAL: Registry key derivation");
-        Self { treasury, registry }
+impl Drop for AnchorMaterial {
+    fn drop(&mut self) {
+        self.treasury_signing_key.non_secure_erase();
     }
+}
 
-    /// Treasury transparent priv key.
-    pub fn treasury_transparent(&self) -> &transparent::keys::AccountPrivKey {
-        self.treasury.transparent()
+impl AnchorMaterial {
+    /// Derive the Treasury signing key and both Orchard full viewing keys.
+    ///
+    /// Each Orchard spending key exists only long enough to produce its full
+    /// viewing key.
+    pub fn derive<P: Parameters>(network: &P, seed: &[u8; 32]) -> Self {
+        let treasury_signing_key = {
+            let account = treasury_account_key(network, seed);
+            account
+                .derive_secret_key(
+                    TransparentKeyScope::EXTERNAL,
+                    NonHardenedChildIndex::from_index(0).expect("index 0"),
+                )
+                .expect("FATAL: transparent key")
+        };
+        Self {
+            treasury_signing_key,
+            treasury_orchard_fvk: orchard_fvk(network, seed, TREASURY_ACCOUNT),
+            registry_orchard_fvk: orchard_fvk(network, seed, REGISTRY_ACCOUNT),
+        }
     }
+}
 
-    /// Treasury P2PKH address.
-    #[cfg(test)]
-    pub fn treasury_taddr<P: Parameters>(
-        &self,
-        _network: &P,
-    ) -> transparent::address::TransparentAddress {
-        let account_pub = self.treasury_transparent().to_account_pubkey();
-        let external_ivk = account_pub
-            .derive_external_ivk()
-            .expect("FATAL: Treasury IVK");
-        external_ivk.default_address().0
-    }
+fn treasury_account_key<P: Parameters>(
+    network: &P,
+    seed: &[u8; 32],
+) -> transparent::keys::AccountPrivKey {
+    transparent::keys::AccountPrivKey::from_seed(
+        network,
+        seed,
+        AccountId::try_from(TREASURY_ACCOUNT).unwrap(),
+    )
+    .expect("FATAL: Treasury key derivation")
+}
 
-    /// External index-0 pubkey used to spend the Treasury funding output.
-    #[cfg(test)]
-    pub fn treasury_external_pubkey(&self) -> secp256k1::PublicKey {
-        self.treasury_transparent()
-            .to_account_pubkey()
-            .derive_address_pubkey(
-                TransparentKeyScope::EXTERNAL,
-                NonHardenedChildIndex::from_index(0).unwrap(),
-            )
-            .expect("FATAL: pubkey derivation")
-    }
-
-    /// Registry Orchard FVK.
-    pub fn registry_orchard_fvk(&self) -> orchard::keys::FullViewingKey {
-        self.registry.orchard().into()
-    }
-
-    /// Treasury Orchard FVK.
-    pub fn treasury_orchard_fvk(&self) -> orchard::keys::FullViewingKey {
-        self.treasury.orchard().into()
-    }
+fn orchard_fvk<P: Parameters>(
+    network: &P,
+    seed: &[u8],
+    account: u32,
+) -> orchard::keys::FullViewingKey {
+    let sk = orchard::keys::SpendingKey::from_zip32_seed(
+        seed,
+        network.coin_type(),
+        AccountId::try_from(account).unwrap(),
+    )
+    .expect("FATAL: Orchard key derivation");
+    (&sk).into()
 }
 
 #[cfg(test)]
 mod tests {
-    use secrecy::Secret;
     use zcash_protocol::consensus::MAIN_NETWORK;
 
     use super::*;
@@ -134,11 +127,73 @@ mod tests {
     }
 
     #[test]
-    fn funding_info_does_not_require_ceremony_keys() {
+    fn funding_info_matches_treasury_account_key() {
         let seed = reference_seed();
         let funding = TreasuryFundingInfo::derive(&MAIN_NETWORK, &seed);
-        let keys = CeremonyKeys::derive(&MAIN_NETWORK, &Secret::new(seed));
-        assert_eq!(funding.address(), &keys.treasury_taddr(&MAIN_NETWORK));
-        assert_eq!(funding.pubkey(), keys.treasury_external_pubkey());
+        let account = treasury_account_key(&MAIN_NETWORK, &seed);
+        let account_pub = account.to_account_pubkey();
+        let address = account_pub
+            .derive_external_ivk()
+            .expect("Treasury IVK")
+            .default_address()
+            .0;
+        let pubkey = account_pub
+            .derive_address_pubkey(
+                TransparentKeyScope::EXTERNAL,
+                NonHardenedChildIndex::from_index(0).unwrap(),
+            )
+            .expect("pubkey");
+        assert_eq!(funding.address(), &address);
+        assert_eq!(funding.pubkey(), pubkey);
+    }
+
+    #[test]
+    fn anchor_material_matches_unified_spending_key() {
+        use zcash_keys::keys::UnifiedSpendingKey;
+
+        let seed = reference_seed();
+        let material = AnchorMaterial::derive(&MAIN_NETWORK, &seed);
+        let treasury = UnifiedSpendingKey::from_seed(
+            &MAIN_NETWORK,
+            &seed,
+            AccountId::try_from(TREASURY_ACCOUNT).unwrap(),
+        )
+        .expect("Treasury USK");
+        let registry = UnifiedSpendingKey::from_seed(
+            &MAIN_NETWORK,
+            &seed,
+            AccountId::try_from(REGISTRY_ACCOUNT).unwrap(),
+        )
+        .expect("Registry USK");
+
+        let usk_signing_key = treasury
+            .transparent()
+            .derive_secret_key(
+                TransparentKeyScope::EXTERNAL,
+                NonHardenedChildIndex::from_index(0).unwrap(),
+            )
+            .expect("USK child key");
+        assert!(material.treasury_signing_key == usk_signing_key);
+
+        let funding = TreasuryFundingInfo::derive(&MAIN_NETWORK, &seed);
+        let account_pub = treasury.transparent().to_account_pubkey();
+        let address = account_pub
+            .derive_external_ivk()
+            .expect("Treasury IVK")
+            .default_address()
+            .0;
+        let pubkey = account_pub
+            .derive_address_pubkey(
+                TransparentKeyScope::EXTERNAL,
+                NonHardenedChildIndex::from_index(0).unwrap(),
+            )
+            .expect("pubkey");
+        assert_eq!(funding.address(), &address);
+        assert_eq!(funding.pubkey(), pubkey);
+
+        let treasury_fvk = orchard::keys::FullViewingKey::from(treasury.orchard());
+        let registry_fvk = orchard::keys::FullViewingKey::from(registry.orchard());
+        assert_eq!(material.treasury_orchard_fvk, treasury_fvk);
+        assert_eq!(material.registry_orchard_fvk, registry_fvk);
     }
 }

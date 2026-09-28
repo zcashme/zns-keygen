@@ -95,6 +95,7 @@ pub(crate) fn transaction_is_absent(error: &str) -> bool {
     lower.contains("no such mempool")
         || lower.contains("no such transaction")
         || lower.contains("no information available about transaction")
+        || lower.contains("transaction not found in mempool or best chain")
 }
 
 #[derive(Deserialize)]
@@ -142,6 +143,9 @@ mod tests {
         ));
         assert!(transaction_is_absent(
             "RPC error: No information available about transaction"
+        ));
+        assert!(transaction_is_absent(
+            "RPC error: Transaction not found in mempool or best chain"
         ));
         assert!(!transaction_is_absent("RPC error: Method not found"));
         assert!(!transaction_is_absent("RPC transport: connection refused"));

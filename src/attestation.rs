@@ -7,23 +7,27 @@
 //! Flow:
 //!   1. `report_data()` — compute the 64-byte blob that binds the attestation
 //!      to this specific capsule (BLAKE2b-512 of fingerprint ‖ capsule_hash).
-//!   2. `request()` — call the PSP via `/dev/sev-guest` to get a signed
-//!      attestation report with that report_data embedded.
-//!   3. The returned `Attestation` struct carries the raw report bytes (for
-//!      writing to disk) plus the parsed fields the manifest needs.
-//!   4. `verify_vcek_report()` — require a VCEK signature under a pinned AMD
-//!      ARK. `Attestation::verify_report_data()` then checks `report_data` and
-//!      that the measurement is not zero. Both run before anything is written
-//!      to disk.
+//!   2. `request()` — call the PSP via `/dev/sev-guest` for a normal SNP
+//!      report. That report is the VCEK-signed evidence.
+//!   3. Fetch the public VCEK and ASK from AMD's Key Distribution Service.
+//!      The ARK in that response is not the trust anchor.
+//!   4. `verify_vcek_report()` — require the ASK to chain to a pinned AMD
+//!      ARK, and the VCEK signature to cover the report.
+//!      `Attestation::verify_report_data()` then checks `report_data` and
+//!      that the measurement is not zero. Both run before the attestation
+//!      report is written to disk. `stored()` repeats the KDS fetch and the
+//!      signature check before a report already on disk is used.
 
 use blake2b_simd::Params as Blake2bParams;
+use sev::Generation;
 use sev::certs::snp::ca::Chain as CaChain;
 use sev::certs::snp::{Certificate, Chain, Verifiable, builtin};
 use sev::firmware::guest::AttestationReport;
 #[cfg(target_os = "linux")]
 use sev::firmware::guest::Firmware;
-use sev::firmware::host::{CertTableEntry, CertType};
+use sev::firmware::host::TcbVersion;
 use sev::parser::ByteParser;
+use std::io::Read;
 
 use crate::fingerprint::SeedFingerprint;
 use crate::{FINGERPRINT_LEN, REPORT_DATA_LEN};
@@ -117,11 +121,11 @@ pub fn report_data(
 /// not receive the VCEK private key. The seed-sealing key is a separate
 /// SEV-SNP derived key, not the VCEK.
 ///
-/// On Linux, `request` asks for the extended report, which includes the
-/// host-supplied certificate table. Before the report is returned:
+/// On Linux, `request` asks the PSP for a normal SNP report, then fetches the
+/// VCEK and the ASK/ARK bundle from AMD KDS. Before the report is returned:
 /// 1. The report must say it was signed by the VCEK, not the VLEK.
-/// 2. The table must contain ARK, ASK, and VCEK certificates. A VLEK is rejected.
-/// 3. The ASK must be signed by a pinned AMD ARK (Milan, Genoa, or Turin).
+/// 2. The chip id must be present so the VCEK can be fetched.
+/// 3. The ASK from KDS must be signed by a pinned AMD ARK (Milan, Genoa, or Turin).
 /// 4. That ASK must sign the VCEK.
 /// 5. The VCEK's ECDSA P-384 / SHA-384 signature must cover the report.
 /// 6. `report_data` must match what we requested, and the measurement must
@@ -143,85 +147,107 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     #[cfg(target_os = "linux")]
     {
         let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
-
-        let (report_bytes, certs) = firmware
-            .get_ext_report(None, Some(*requested_report_data), None)
-            .expect("failed to request SEV-SNP extended attestation report");
-        let certs = certs.expect("FATAL: extended attestation report has no certificate table");
-
-        // Parse the report to extract the fields the manifest needs.
+        let report_bytes = firmware
+            .get_report(None, Some(*requested_report_data), None)
+            .expect("failed to request SEV-SNP attestation report");
         let report = AttestationReport::from_bytes(&report_bytes)
             .expect("failed to parse SEV-SNP attestation report");
-        verify_vcek_report(&report, &certs).expect("FATAL: attestation signature verification");
+        let (ask, vcek) =
+            fetch_endorsement(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
+        verify_vcek_report(&report, &ask, &vcek)
+            .expect("FATAL: attestation signature verification");
 
-        let tcb = report.current_tcb;
-        let attestation = Attestation {
-            report_bytes,
-            measurement: report.measurement,
-            guest_policy: report.policy.into(),
-            tcb_version: format!(
-                "bootloader={} tee={} snp={} microcode={}",
-                tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
-            ),
-            report_data: *requested_report_data,
-        };
-
-        // report_data and measurement, after the signature check.
+        let attestation = attestation_from_report(report_bytes, *requested_report_data);
         attestation.verify_report_data();
-
         attestation
     }
 }
 
-/// Verify that `report` was signed by a VCEK whose ASK chains to a pinned AMD ARK.
+/// Load an attestation report and verify it again before its fields are used.
 ///
-/// The certificate table is the one returned with the extended attestation
-/// report. Its ARK is not trusted by itself: the ASK must verify under the
-/// Milan, Genoa, or Turin ARK built into the `sev` crate.
+/// On Linux this parses the stored report, fetches the VCEK and ASK from AMD
+/// KDS, and checks the signature, `report_data`, and measurement. It does not
+/// call the PSP again. The file lives on host-backed storage, so an earlier
+/// check is not reused.
+///
+/// On other platforms the ceremony uses the same development stub as `request`.
+pub fn stored(report_bytes: Vec<u8>, expected_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
+    #[cfg(target_os = "linux")]
+    {
+        let report = AttestationReport::from_bytes(&report_bytes)
+            .expect("failed to parse stored SEV-SNP attestation report");
+        let (ask, vcek) =
+            fetch_endorsement(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
+        verify_vcek_report(&report, &ask, &vcek)
+            .expect("FATAL: stored attestation signature verification");
+
+        let attestation = attestation_from_report(report_bytes, *expected_report_data);
+        attestation.verify_report_data();
+        attestation
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = report_bytes;
+        Attestation {
+            report_bytes: Vec::new(),
+            measurement: [0u8; 48],
+            guest_policy: 0,
+            tcb_version: "dev".into(),
+            report_data: *expected_report_data,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attestation_from_report(
+    report_bytes: Vec<u8>,
+    report_data: [u8; REPORT_DATA_LEN],
+) -> Attestation {
+    let report = AttestationReport::from_bytes(&report_bytes)
+        .expect("failed to parse SEV-SNP attestation report");
+    let tcb = report.current_tcb;
+    Attestation {
+        report_bytes,
+        measurement: report.measurement,
+        guest_policy: report.policy.into(),
+        tcb_version: format!(
+            "bootloader={} tee={} snp={} microcode={}",
+            tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
+        ),
+        report_data,
+    }
+}
+
+/// Verify that `report` was signed by `vcek`, and that `ask` chains to a pinned AMD ARK.
+///
+/// `ask` and `vcek` are public certificates obtained from AMD KDS. The ARK
+/// served beside the ASK is not trusted by itself: the ASK must verify under
+/// the Milan, Genoa, or Turin ARK built into the `sev` crate.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn verify_vcek_report(
     report: &AttestationReport,
-    certs: &[CertTableEntry],
+    ask: &Certificate,
+    vcek: &Certificate,
 ) -> Result<(), String> {
-    if report.key_info.mask_chip_key() {
-        return Err("attestation report signature is masked".into());
-    }
-    if report.key_info.signing_key() != 0 {
-        return Err("attestation report was not signed by the VCEK".into());
-    }
-    if certs.iter().any(|entry| entry.cert_type == CertType::VLEK) {
-        return Err("VLEK certificates are not accepted".into());
-    }
-
-    let ask = one_cert(certs, CertType::ASK)?;
-    let vcek = one_cert(certs, CertType::VCEK)?;
-    // Present so the extended report actually carried a root, then ignored
-    // in favor of the pinned AMD copy.
-    let _table_ark = one_cert(certs, CertType::ARK)?;
-
-    let chain = chain_under_pinned_ark(ask, vcek)?;
+    vcek_signing_key(report)?;
+    let chain = chain_under_pinned_ark(ask.clone(), vcek.clone())?;
     (&chain, report)
         .verify()
         .map_err(|e| format!("VCEK signature verification failed: {e}"))?;
     Ok(())
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn one_cert(certs: &[CertTableEntry], kind: CertType) -> Result<Certificate, String> {
-    let mut found = None;
-    for entry in certs {
-        if entry.cert_type != kind {
-            continue;
-        }
-        if found.is_some() {
-            return Err(format!("more than one {kind:?} certificate"));
-        }
-        found = Some(
-            Certificate::from_der(&entry.data)
-                .map_err(|e| format!("invalid {kind:?} certificate: {e}"))?,
-        );
+fn vcek_signing_key(report: &AttestationReport) -> Result<(), String> {
+    if report.key_info.mask_chip_key() {
+        return Err("attestation report signature is masked".into());
     }
-    found.ok_or_else(|| format!("{kind:?} certificate missing"))
+    if report.key_info.signing_key() != 0 {
+        return Err("attestation report was not signed by the VCEK".into());
+    }
+    if report.chip_id.iter().all(|byte| *byte == 0) {
+        return Err("attestation report chip id is zero".into());
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -247,6 +273,123 @@ fn chain_under_pinned_ark(ask: Certificate, vcek: Certificate) -> Result<Chain, 
     Err("ASK is not signed by a pinned AMD ARK (Milan, Genoa, or Turin)".into())
 }
 
+const KDS_ORIGIN: &str = "https://kdsintf.amd.com/vcek/v1";
+
+/// AMD KDS product name for the CPUID family and model in an SNP report.
+///
+/// Siena and Bergamo use the Genoa key hierarchy. Venice has no pinned ARK here.
+fn kds_product_name(family: u8, model: u8) -> Result<&'static str, String> {
+    match Generation::try_from((family, model)) {
+        Ok(Generation::Milan) => Ok("Milan"),
+        Ok(Generation::Genoa) => Ok("Genoa"),
+        Ok(Generation::Turin) => Ok("Turin"),
+        Ok(generation) => Err(format!("no pinned AMD ARK for {}", generation.titlecase())),
+        Err(error) => Err(format!(
+            "attestation CPU family {family:#x} model {model:#x}: {error}"
+        )),
+    }
+}
+
+fn kds_product(report: &AttestationReport) -> Result<&'static str, String> {
+    let family = report
+        .cpuid_fam_id
+        .ok_or("attestation report has no CPU family")?;
+    let model = report
+        .cpuid_mod_id
+        .ok_or("attestation report has no CPU model")?;
+    kds_product_name(family, model)
+}
+
+/// VCEK URL for the reported TCB. That is the TCB the VCEK was derived from.
+fn vcek_url(product: &str, chip_id: &[u8; 64], tcb: &TcbVersion) -> String {
+    let mut url = format!(
+        "{KDS_ORIGIN}/{product}/{}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+        hex::encode(chip_id),
+        tcb.bootloader,
+        tcb.tee,
+        tcb.snp,
+        tcb.microcode
+    );
+    if let Some(fmc) = tcb.fmc {
+        url.push_str(&format!("&fmcSPL={fmc}"));
+    }
+    url
+}
+
+fn cert_chain_url(product: &str) -> String {
+    format!("{KDS_ORIGIN}/{product}/cert_chain")
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fetch_endorsement(report: &AttestationReport) -> Result<(Certificate, Certificate), String> {
+    vcek_signing_key(report)?;
+    let product = kds_product(report)?;
+    tracing::info!(product, "fetching VCEK and ASK from AMD KDS");
+
+    let vcek_bytes = https_get(&vcek_url(product, &report.chip_id, &report.reported_tcb))?;
+    let vcek = Certificate::from_der(&vcek_bytes)
+        .or_else(|_| Certificate::from_pem(&vcek_bytes))
+        .map_err(|error| format!("AMD KDS VCEK: {error}"))?;
+
+    let chain_bytes = https_get(&cert_chain_url(product))?;
+    let chain_certs = pem_certificates(&chain_bytes)?;
+    let ask = ask_from_kds_chain(&chain_certs, &vcek)?;
+    Ok((ask, vcek))
+}
+
+/// The cert-chain bundle holds the ASK and the KDS ARK. Return the ASK that
+/// chains to a pinned ARK and signs this VCEK.
+fn ask_from_kds_chain(
+    chain_certs: &[Certificate],
+    vcek: &Certificate,
+) -> Result<Certificate, String> {
+    let mut chain_error = String::from("AMD KDS cert chain contained no ASK");
+    for ask in chain_certs {
+        match chain_under_pinned_ark(ask.clone(), vcek.clone()) {
+            Ok(_) => return Ok(ask.clone()),
+            Err(error) => chain_error = error,
+        }
+    }
+    Err(chain_error)
+}
+
+fn pem_certificates(bundle: &[u8]) -> Result<Vec<Certificate>, String> {
+    let text =
+        std::str::from_utf8(bundle).map_err(|_| "AMD KDS cert chain is not UTF-8".to_string())?;
+    let mut certificates = Vec::new();
+    for block in text.split("-----END CERTIFICATE-----") {
+        let Some(start) = block.find("-----BEGIN CERTIFICATE-----") else {
+            continue;
+        };
+        let pem = format!("{}-----END CERTIFICATE-----\n", &block[start..]);
+        let certificate = Certificate::from_pem(pem.as_bytes())
+            .map_err(|error| format!("AMD KDS certificate: {error}"))?;
+        certificates.push(certificate);
+    }
+    if certificates.is_empty() {
+        return Err("AMD KDS cert chain contained no certificates".into());
+    }
+    Ok(certificates)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn https_get(url: &str) -> Result<Vec<u8>, String> {
+    let response = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|error| format!("AMD KDS request failed: {error}"))?;
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(1024 * 1024)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("AMD KDS response: {error}"))?;
+    if body.is_empty() {
+        return Err("AMD KDS response was empty".into());
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,47 +397,105 @@ mod tests {
     const MILAN_VCEK_DER: &[u8] = include_bytes!("testdata/vcek_milan.der");
     const MILAN_REPORT_HEX: &[u8] = include_bytes!("testdata/report_milan.hex");
 
-    fn milan_certs() -> Vec<CertTableEntry> {
-        let ark = builtin::milan::ark().unwrap().to_der().unwrap();
-        let ask = builtin::milan::ask().unwrap().to_der().unwrap();
-        vec![
-            CertTableEntry::new(CertType::ARK, ark),
-            CertTableEntry::new(CertType::ASK, ask),
-            CertTableEntry::new(CertType::VCEK, MILAN_VCEK_DER.to_vec()),
-        ]
-    }
-
     fn milan_report() -> AttestationReport {
         let bytes = hex::decode(MILAN_REPORT_HEX).unwrap();
         AttestationReport::from_bytes(&bytes).unwrap()
     }
 
+    fn milan_ask_and_vcek() -> (Certificate, Certificate) {
+        let ask = builtin::milan::ask().unwrap();
+        let vcek = Certificate::from_der(MILAN_VCEK_DER).unwrap();
+        (ask, vcek)
+    }
+
     #[test]
     fn milan_vcek_report_verifies() {
-        verify_vcek_report(&milan_report(), &milan_certs()).unwrap();
+        let (ask, vcek) = milan_ask_and_vcek();
+        verify_vcek_report(&milan_report(), &ask, &vcek).unwrap();
     }
 
     #[test]
     fn modified_report_fails_vcek_signature() {
+        let (ask, vcek) = milan_ask_and_vcek();
         let mut bytes = hex::decode(MILAN_REPORT_HEX).unwrap();
         bytes[21] ^= 0x80;
         let report = AttestationReport::from_bytes(&bytes).unwrap();
-        assert!(verify_vcek_report(&report, &milan_certs()).is_err());
+        assert!(verify_vcek_report(&report, &ask, &vcek).is_err());
     }
 
     #[test]
-    fn vlek_certificate_is_rejected() {
-        let mut certs = milan_certs();
-        certs.push(CertTableEntry::new(CertType::VLEK, MILAN_VCEK_DER.to_vec()));
-        assert!(verify_vcek_report(&milan_report(), &certs).is_err());
+    fn vlek_signing_key_is_rejected() {
+        let (ask, vcek) = milan_ask_and_vcek();
+        let mut report = milan_report();
+        report.key_info = sev::firmware::guest::KeyInfo::from(1 << 2);
+        let error = verify_vcek_report(&report, &ask, &vcek).unwrap_err();
+        assert!(error.contains("VCEK"), "{error}");
     }
 
     #[test]
-    fn missing_vcek_is_rejected() {
-        let certs: Vec<_> = milan_certs()
-            .into_iter()
-            .filter(|entry| entry.cert_type != CertType::VCEK)
-            .collect();
-        assert!(verify_vcek_report(&milan_report(), &certs).is_err());
+    fn masked_signature_is_rejected() {
+        let (ask, vcek) = milan_ask_and_vcek();
+        let mut report = milan_report();
+        report.key_info = sev::firmware::guest::KeyInfo::from(1 << 1);
+        let error = verify_vcek_report(&report, &ask, &vcek).unwrap_err();
+        assert!(error.contains("masked"), "{error}");
+    }
+
+    #[test]
+    fn ask_from_another_generation_is_rejected() {
+        let vcek = Certificate::from_der(MILAN_VCEK_DER).unwrap();
+        let ask = builtin::turin::ask().unwrap();
+        assert!(verify_vcek_report(&milan_report(), &ask, &vcek).is_err());
+    }
+
+    #[test]
+    fn kds_chain_selects_the_ask_when_the_ark_comes_first() {
+        let (ask, vcek) = milan_ask_and_vcek();
+        let ark = builtin::milan::ark().unwrap();
+        let bundle = [ark.to_pem().unwrap(), ask.to_pem().unwrap()].concat();
+        let certificates = pem_certificates(&bundle).unwrap();
+        assert_eq!(certificates.len(), 2);
+        let selected = ask_from_kds_chain(&certificates, &vcek).unwrap();
+        verify_vcek_report(&milan_report(), &selected, &vcek).unwrap();
+    }
+
+    #[test]
+    fn kds_product_names_match_the_pinned_roots() {
+        assert_eq!(kds_product_name(0x19, 0x01).unwrap(), "Milan");
+        assert_eq!(kds_product_name(0x19, 0x11).unwrap(), "Genoa");
+        // EPYC 8024P (Siena) is in the Genoa key hierarchy.
+        assert_eq!(kds_product_name(0x19, 0xA0).unwrap(), "Genoa");
+        assert_eq!(kds_product_name(0x1A, 0x00).unwrap(), "Turin");
+        assert!(kds_product_name(0x1A, 0x50).is_err());
+    }
+
+    #[test]
+    fn vcek_url_uses_the_reported_tcb_and_chip_id() {
+        let chip_id = [0xAB; 64];
+        let tcb = TcbVersion {
+            fmc: None,
+            bootloader: 1,
+            tee: 2,
+            snp: 3,
+            microcode: 4,
+        };
+        let url = vcek_url("Genoa", &chip_id, &tcb);
+        assert_eq!(
+            url,
+            format!(
+                "https://kdsintf.amd.com/vcek/v1/Genoa/{}?blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=4",
+                hex::encode(chip_id)
+            )
+        );
+        assert_eq!(
+            cert_chain_url("Genoa"),
+            "https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain"
+        );
+
+        let turin = TcbVersion {
+            fmc: Some(7),
+            ..tcb
+        };
+        assert!(vcek_url("Turin", &chip_id, &turin).ends_with("&fmcSPL=7"));
     }
 }

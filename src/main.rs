@@ -313,10 +313,30 @@ fn resolve_broadcast(state: ceremony::CeremonyState, state_path: &Path) -> cerem
         ceremony::BroadcastAction::SendStored => {
             let raw_tx = state
                 .raw_tx()
-                .expect("FATAL: built anchor has no raw transaction");
+                .expect("FATAL: built anchor has no raw transaction")
+                .to_string();
             tracing::info!(txid, "broadcasting stored anchor");
-            let sent = rpc::Rpc::send_raw(raw_tx)
-                .unwrap_or_else(|error| panic!("FATAL: sendrawtransaction: {error}"));
+            let sent = match rpc::Rpc::send_raw(&raw_tx) {
+                Ok(txid) => txid,
+                Err(error)
+                    if error
+                        .to_ascii_lowercase()
+                        .contains("greater than its expiry") =>
+                {
+                    tracing::warn!(txid, "stored anchor expired before broadcast; rebuilding");
+
+                    let state = state.expired_anchor();
+                    ceremony::store(state_path, &state);
+
+                    tracing::info!(
+                        phase = %state.phase(),
+                        "expired anchor discarded; rebuilding from funded state"
+                    );
+
+                    return state;
+                }
+                Err(error) => panic!("FATAL: sendrawtransaction: {error}"),
+            };
             if sent != txid {
                 panic!("FATAL: broadcast txid {sent} does not match stored {txid}");
             }

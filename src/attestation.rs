@@ -67,17 +67,17 @@ impl Attestation {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn verify_report_data(&self) {
         let report = AttestationReport::from_bytes(&self.report_bytes)
-            .expect("failed to parse attestation report for self-verification");
+            .expect("FATAL: parse attestation report for self-verification");
 
         assert_eq!(
             report.report_data, self.report_data,
-            "attestation report_data mismatch: the PSP did not embed the report_data we requested"
+            "FATAL: attestation report_data mismatch: the PSP did not embed the report_data we requested"
         );
 
         // Sanity: measurement must not be all zeros (would indicate a broken launch).
         assert!(
             report.measurement.iter().any(|&b| b != 0),
-            "attestation measurement is all zeros — VM may not have been properly launched"
+            "FATAL: attestation measurement is all zeros — VM may not have been properly launched"
         );
     }
 }
@@ -146,12 +146,12 @@ pub fn request(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     }
     #[cfg(target_os = "linux")]
     {
-        let mut firmware = Firmware::open().expect("failed to open /dev/sev-guest");
+        let mut firmware = Firmware::open().expect("FATAL: open /dev/sev-guest");
         let report_bytes = firmware
             .get_report(None, Some(*requested_report_data), None)
-            .expect("failed to request SEV-SNP attestation report");
+            .expect("FATAL: request SEV-SNP attestation report");
         let report = AttestationReport::from_bytes(&report_bytes)
-            .expect("failed to parse SEV-SNP attestation report");
+            .expect("FATAL: parse SEV-SNP attestation report");
         let (ask, vcek) =
             fetch_endorsement(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
         verify_vcek_report(&report, &ask, &vcek)
@@ -175,7 +175,7 @@ pub fn stored(report_bytes: Vec<u8>, expected_report_data: &[u8; REPORT_DATA_LEN
     #[cfg(target_os = "linux")]
     {
         let report = AttestationReport::from_bytes(&report_bytes)
-            .expect("failed to parse stored SEV-SNP attestation report");
+            .expect("FATAL: parse stored SEV-SNP attestation report");
         let (ask, vcek) =
             fetch_endorsement(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
         verify_vcek_report(&report, &ask, &vcek)
@@ -204,7 +204,7 @@ fn attestation_from_report(
     report_data: [u8; REPORT_DATA_LEN],
 ) -> Attestation {
     let report = AttestationReport::from_bytes(&report_bytes)
-        .expect("failed to parse SEV-SNP attestation report");
+        .expect("FATAL: parse SEV-SNP attestation report");
     let tcb = report.current_tcb;
     Attestation {
         report_bytes,

@@ -176,7 +176,7 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
         tracing::info!("=== SEALING ===");
         let sealing_key = derive_sealing_key();
         let capsule = seal_seed(&seed, &sealing_key, fingerprint);
-        let capsule_bytes = postcard::to_allocvec(&capsule).unwrap();
+        let capsule_bytes = postcard::to_allocvec(&capsule).expect("FATAL: serialize capsule");
         let capsule_hash = blake2b256(&capsule_bytes);
         write_secret_file(capsule_path, &capsule_bytes);
         tracing::info!("capsule persisted; dropping plaintext seed");
@@ -219,7 +219,7 @@ fn attest(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Ceremo
             write_atomic(attestation_path, &attestation.report_bytes, 0o644);
             tracing::info!("attestation persisted");
         }
-        Err(error) => panic!("inspect {}: {error}", attestation_path.display()),
+        Err(error) => panic!("FATAL: inspect {}: {error}", attestation_path.display()),
     }
     let state = state.waiting_for_funds();
     ceremony::store(state_path, &state);
@@ -413,19 +413,37 @@ fn poll_until_funded(
 }
 
 /// Check for sufficient UTXOs.
+///
+/// An empty address is "no funding yet". A Zebra failure is logged and
+/// retried by the caller. It is not treated as an empty address.
 fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
     let encoded = addr.to_zcash_address(NETWORK.network_type()).encode();
-    let utxos = rpc::Rpc::address_utxos(&encoded).ok()?;
+    match funding_utxos(rpc::Rpc::address_utxos(&encoded)) {
+        Ok(Some(utxos)) => Some(utxos),
+        Ok(None) => {
+            tracing::info!("no funding yet");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Treasury funding check failed; retrying");
+            None
+        }
+    }
+}
+
+fn funding_utxos(
+    result: Result<Vec<rpc::AddressUtxo>, String>,
+) -> Result<Option<Vec<rpc::AddressUtxo>>, String> {
+    let utxos = result?;
     if utxos.is_empty() {
-        tracing::info!("no funding yet");
-        return None;
+        return Ok(None);
     }
     let total: u64 = utxos.iter().map(|u| u.satoshis).sum();
     assert!(
         total >= 500_000,
         "FATAL: insufficient funding: {total} zat, need at least 500,000"
     );
-    Some(utxos)
+    Ok(Some(utxos))
 }
 
 /// Convert RPC UTXO to transparent input.
@@ -523,7 +541,7 @@ fn seal_seed_with_nonce(
     let nonce_ref = <&XNonce>::from(nonce.as_slice());
     let ciphertext = seed
         .expose(|s| cipher.encrypt(nonce_ref, Payload { msg: s, aad: &aad }))
-        .expect("encrypt seed");
+        .expect("FATAL: encrypt seed");
     assert_eq!(ciphertext.len(), CIPHERTEXT_LEN);
     SeedCapsule {
         magic: CAPSULE_MAGIC,
@@ -634,8 +652,7 @@ fn custody_manifest(
         seed_fingerprint: fingerprint.to_string(),
         capsule_file: CAPSULE_FILE,
         capsule_hash_blake2b256: hex::encode(capsule_hash),
-        capsule_format: String::from_utf8(CAPSULE_MAGIC.to_vec())
-            .unwrap_or_else(|_| "unknown".into()),
+        capsule_format: String::from_utf8(CAPSULE_MAGIC.to_vec()).expect("FATAL: capsule magic"),
         seed_length: SEED_LEN,
         treasury_account: TREASURY_ACCOUNT,
         registry_account: REGISTRY_ACCOUNT,
@@ -653,7 +670,7 @@ fn custody_manifest(
         migration: "none",
         signer_socket: "none",
     };
-    toml::to_string(&m).unwrap()
+    toml::to_string(&m).expect("FATAL: serialize custody manifest")
 }
 
 // ── Mint config ───────────────────────────────────────────────────
@@ -671,7 +688,7 @@ fn mint_config_toml_with_birthday(fingerprint: SeedFingerprint, birthday: BlockH
         expected_seed_fingerprint: fingerprint.to_string(),
         birthday: u32::from(birthday),
     })
-    .unwrap()
+    .expect("FATAL: serialize mint config")
 }
 
 // ── Hashing ───────────────────────────────────────────────────────
@@ -708,7 +725,7 @@ fn fill_entropy(dest: &mut [u8]) {
             spin_loop();
         }
         if value == 0 {
-            panic!("RDSEED unavailable");
+            panic!("FATAL: RDSEED unavailable");
         }
         let bytes = value.to_ne_bytes();
         let take = std::cmp::min(bytes.len(), dest.len() - offset);
@@ -724,21 +741,21 @@ fn fill_entropy(dest: &mut [u8]) {
     use std::io::Read;
     std::io::stdin()
         .read_exact(dest)
-        .expect("entropy unavailable");
+        .expect("FATAL: entropy unavailable");
 }
 
 // ── Sealing key derivation ────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
 fn derive_sealing_key() -> SealingKey {
-    let mut firmware = Firmware::open().expect("open /dev/sev-guest");
+    let mut firmware = Firmware::open().expect("FATAL: open /dev/sev-guest");
     let mut gf = GuestFieldSelect::default();
     gf.set_guest_policy(true);
     gf.set_measurement(true);
     let request = DerivedKey::new(false, gf, 0, 0, 0, None);
     let mut key = firmware
         .get_derived_key(Some(1), request)
-        .expect("derive SEV-SNP sealing key");
+        .expect("FATAL: derive SEV-SNP sealing key");
     let sk = SealingKey(Zeroizing::new(key));
     key.zeroize();
     sk
@@ -753,9 +770,9 @@ fn derive_sealing_key() -> SealingKey {
 
 fn ensure_absent(path: &Path) {
     match fs::symlink_metadata(path) {
-        Ok(_) => panic!("{} already exists", path.display()),
+        Ok(_) => panic!("FATAL: {} already exists", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("inspect {}: {e}", path.display()),
+        Err(e) => panic!("FATAL: inspect {}: {e}", path.display()),
     }
 }
 
@@ -765,9 +782,9 @@ fn write_secret_file(path: &Path, bytes: &[u8]) {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .expect("create secret file");
-    f.write_all(bytes).expect("write file");
-    f.sync_all().expect("sync file");
+        .expect("FATAL: create secret file");
+    f.write_all(bytes).expect("FATAL: write file");
+    f.sync_all().expect("FATAL: sync file");
     sync_parent(path);
 }
 
@@ -783,15 +800,15 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) {
         .truncate(true)
         .mode(mode)
         .open(&tmp_path)
-        .unwrap_or_else(|error| panic!("create {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: create {}: {error}", tmp_path.display()));
     file.write_all(bytes)
-        .unwrap_or_else(|error| panic!("write {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: write {}: {error}", tmp_path.display()));
     file.sync_all()
-        .unwrap_or_else(|error| panic!("sync {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: sync {}: {error}", tmp_path.display()));
     drop(file);
     fs::rename(&tmp_path, path).unwrap_or_else(|error| {
         panic!(
-            "rename {} to {}: {error}",
+            "FATAL: rename {} to {}: {error}",
             tmp_path.display(),
             path.display()
         )
@@ -809,8 +826,8 @@ fn write_atomic_verified(path: &Path, expected: &[u8], mode: u32) {
             panic!("FATAL: {} is a symlink", path.display());
         }
         Ok(_) => {
-            let existing =
-                fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let existing = fs::read(path)
+                .unwrap_or_else(|error| panic!("FATAL: read {}: {error}", path.display()));
             assert_eq!(
                 existing,
                 expected,
@@ -821,7 +838,7 @@ fn write_atomic_verified(path: &Path, expected: &[u8], mode: u32) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             write_atomic(path, expected, mode);
         }
-        Err(error) => panic!("inspect {}: {error}", path.display()),
+        Err(error) => panic!("FATAL: inspect {}: {error}", path.display()),
     }
 }
 
@@ -838,7 +855,7 @@ fn sync_parent(path: &Path) {
         .unwrap_or(Path::new("."));
     File::open(parent)
         .and_then(|f| f.sync_all())
-        .expect("sync parent");
+        .expect("FATAL: sync parent");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -1068,5 +1085,14 @@ mod tests {
         assert!(symlink.is_err());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn funding_rpc_error_is_not_an_empty_address() {
+        match funding_utxos(Err("RPC error: Method not found".into())) {
+            Err(error) => assert!(error.contains("Method not found")),
+            Ok(_) => panic!("a Zebra error must not look like an empty address"),
+        }
+        assert!(funding_utxos(Ok(vec![])).unwrap().is_none());
     }
 }

@@ -292,7 +292,7 @@ pub fn load(state_path: &Path, capsule_path: &Path) -> Result<Option<CeremonySta
 /// The temporary file is synced before it is renamed over the previous state.
 pub fn store(state_path: &Path, state: &CeremonyState) {
     let record = Record::from(state);
-    let bytes = toml::to_string(&record).expect("ceremony state serializes");
+    let bytes = toml::to_string(&record).expect("FATAL: serialize ceremony state");
     let tmp_path = temp_path(state_path);
     let mut file = OpenOptions::new()
         .write(true)
@@ -300,15 +300,15 @@ pub fn store(state_path: &Path, state: &CeremonyState) {
         .truncate(true)
         .mode(0o600)
         .open(&tmp_path)
-        .unwrap_or_else(|error| panic!("create {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: create {}: {error}", tmp_path.display()));
     file.write_all(bytes.as_bytes())
-        .unwrap_or_else(|error| panic!("write {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: write {}: {error}", tmp_path.display()));
     file.sync_all()
-        .unwrap_or_else(|error| panic!("sync {}: {error}", tmp_path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: sync {}: {error}", tmp_path.display()));
     drop(file);
     fs::rename(&tmp_path, state_path).unwrap_or_else(|error| {
         panic!(
-            "rename {} to {}: {error}",
+            "FATAL: rename {} to {}: {error}",
             tmp_path.display(),
             state_path.display()
         )
@@ -349,7 +349,7 @@ fn sync_parent(path: &Path) {
         .unwrap_or(Path::new("."));
     File::open(parent)
         .and_then(|file| file.sync_all())
-        .unwrap_or_else(|error| panic!("sync parent of {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("FATAL: sync parent of {}: {error}", path.display()));
 }
 
 fn parse_transparent_address(

@@ -1,21 +1,20 @@
 //! Anchor transaction builder.
 
+use blake2b_simd::Hash as Blake2bHash;
 use orchard::builder::{Builder as OrchardBuilder, BundleType};
 use orchard::bundle::BundleVersion;
 use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
-use transparent::builder::{TransparentBuilder, TransparentInputInfo, TransparentSigningSet};
+use transparent::builder::{TransparentBuilder, TransparentInputInfo};
 use zcash_primitives::transaction::fees::FeeRule as _;
 use zcash_primitives::transaction::fees::transparent::InputView as _;
 use zcash_primitives::transaction::fees::zip317::FeeRule;
 use zcash_primitives::transaction::{
-    self, Authorization, TransactionData,
+    self, Authorization, TransactionData, TxDigests,
     sighash::{SignableInput, signature_hash},
     txid::TxIdDigester,
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
-
-use crate::keys::CeremonyKeys;
 
 const NUM_ANCHORS: usize = 40;
 const DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
@@ -36,7 +35,9 @@ impl Authorization for UnauthorizedTx {
 /// Funded by transparent inputs from the operator.
 pub fn build_anchor_transaction<P: Parameters>(
     network: &P,
-    keys: &CeremonyKeys,
+    treasury_sk: &mut secp256k1::SecretKey,
+    treasury_fvk: &orchard::keys::FullViewingKey,
+    registry_fvk: &orchard::keys::FullViewingKey,
     target_height: BlockHeight,
     inputs: &[TransparentInputInfo],
 ) -> zcash_primitives::transaction::Transaction {
@@ -69,9 +70,6 @@ pub fn build_anchor_transaction<P: Parameters>(
         change = change.into_u64(),
         "economics"
     );
-
-    let registry_fvk = keys.registry_orchard_fvk();
-    let treasury_fvk = keys.treasury_orchard_fvk();
 
     // ── 1. Build Ironwood bundle (unproven, unsigned) ───────────
     let bundle_version = BundleVersion::ironwood_v3();
@@ -139,31 +137,11 @@ pub fn build_anchor_transaction<P: Parameters>(
     let txid_parts = unauthed_tx.digest(TxIdDigester);
 
     // ── 5. Authorize transparent inputs ─────────────────────────
-    let treasury_tkey = keys.treasury_transparent();
-    let mut signing_set = TransparentSigningSet::new();
-    let scope = transparent::keys::TransparentKeyScope::EXTERNAL;
-    for _ in inputs {
-        let idx = transparent::keys::NonHardenedChildIndex::from_index(0).expect("FATAL: index");
-        let sk = treasury_tkey
-            .derive_secret_key(scope, idx)
-            .expect("FATAL: transparent key");
-        signing_set.add_key(sk);
-    }
-
-    let unauthed_ref = &unauthed_tx;
-    let txid_ref = &txid_parts;
-    let authorized_transparent = transparent_bundle
-        .map(|b| {
-            b.apply_signatures(
-                |input| {
-                    *signature_hash(unauthed_ref, &SignableInput::Transparent(input), txid_ref)
-                        .as_ref()
-                },
-                &signing_set,
-            )
-        })
-        .transpose()
-        .expect("FATAL: transparent signing");
+    // The signing key is erased once the signatures exist, before the
+    // Ironwood proof.
+    let authorized_transparent = transparent_bundle.map(|bundle| {
+        authorize_transparent(bundle, inputs, &unauthed_tx, &txid_parts, treasury_sk)
+    });
 
     // ── 6. Create Ironwood proof + sign ─────────────────────────
     // Output-only bundle: all spends are dummies, auto-signed by prepare.
@@ -190,4 +168,154 @@ pub fn build_anchor_transaction<P: Parameters>(
     );
 
     authorized_tx.freeze().expect("FATAL: freeze")
+}
+
+/// Sign every transparent input with `treasury_sk`, erase that key, then apply
+/// the signatures.
+fn authorize_transparent(
+    bundle: transparent::bundle::Bundle<transparent::builder::Unauthorized>,
+    inputs: &[TransparentInputInfo],
+    unauthed_tx: &TransactionData<UnauthorizedTx>,
+    txid_parts: &TxDigests<Blake2bHash>,
+    treasury_sk: &mut secp256k1::SecretKey,
+) -> transparent::bundle::Bundle<transparent::bundle::Authorized> {
+    let verify_ctx = secp256k1::Secp256k1::verification_only();
+    let signatures = {
+        let sign_ctx = secp256k1::Secp256k1::signing_only();
+        let signed: Result<
+            Vec<secp256k1::ecdsa::Signature>,
+            transparent::sighash::InvalidInputIndex,
+        > = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                let script = info.coin().script_pubkey();
+                let signable = transparent::sighash::SignableInput::from_parts(
+                    &bundle,
+                    transparent::sighash::SighashType::ALL,
+                    index,
+                    script,
+                    script,
+                    info.coin().value(),
+                )?;
+                let sighash = signature_hash(
+                    unauthed_tx,
+                    &SignableInput::Transparent(signable),
+                    txid_parts,
+                );
+                let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+                Ok(sign_ctx.sign_ecdsa(&msg, treasury_sk))
+            })
+            .collect();
+        treasury_sk.non_secure_erase();
+        signed.expect("FATAL: transparent sighash input")
+    };
+
+    bundle
+        .prepare_transparent_signatures(
+            |input| {
+                *signature_hash(unauthed_tx, &SignableInput::Transparent(input), txid_parts)
+                    .as_ref()
+            },
+            &verify_ctx,
+        )
+        .expect("FATAL: prepare transparent signatures")
+        .append_external_signatures(&signatures)
+        .expect("FATAL: transparent signature")
+        .finalize_signatures()
+        .expect("FATAL: transparent signing")
+}
+
+#[cfg(test)]
+mod tests {
+    use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+    use transparent::address::TransparentAddress;
+    use transparent::builder::{SpendInfo, TransparentBuilder, TransparentInputInfo};
+    use transparent::bundle::{OutPoint, TxOut};
+    use zcash_protocol::consensus::{BlockHeight, BranchId, MAIN_NETWORK};
+    use zcash_protocol::value::Zatoshis;
+    use zcash_script::script::Evaluable;
+
+    use super::*;
+
+    fn p2pkh_input(pubkey: PublicKey, prevout_byte: u8, value: u64) -> TransparentInputInfo {
+        let address = TransparentAddress::PublicKeyHash(transparent::util::hash160::hash(
+            &pubkey.serialize(),
+        ));
+        let coin = TxOut::new(Zatoshis::from_u64(value).unwrap(), address.script().into());
+        TransparentInputInfo::from_parts(
+            OutPoint::new([prevout_byte; 32], 0),
+            coin,
+            SpendInfo::P2pkh { pubkey },
+        )
+        .expect("p2pkh input")
+    }
+
+    #[test]
+    fn transparent_signatures_verify_and_signing_key_is_erased() {
+        let mut sk = SecretKey::from_slice(&[2u8; 32]).expect("signing key");
+        let pubkey = PublicKey::from_secret_key(&Secp256k1::signing_only(), &sk);
+        let inputs = vec![
+            p2pkh_input(pubkey, 1, 250_000),
+            p2pkh_input(pubkey, 2, 250_000),
+        ];
+
+        let mut builder = TransparentBuilder::empty();
+        for input in &inputs {
+            builder.add_input(input.clone());
+        }
+        let bundle = builder.build().expect("transparent bundle");
+
+        let height = BlockHeight::from_u32(3_000_000);
+        let unauthed = TransactionData::from_parts_v6(
+            BranchId::for_height(&MAIN_NETWORK, height),
+            0,
+            height + 40,
+            Some(bundle.clone()),
+            None,
+            None,
+            None,
+        );
+        let txid_parts = unauthed.digest(TxIdDigester);
+        let authorized = authorize_transparent(bundle, &inputs, &unauthed, &txid_parts, &mut sk);
+
+        assert_eq!(
+            sk.as_ref(),
+            &[1u8; 32],
+            "signing key should be overwritten after signing"
+        );
+
+        let verify = Secp256k1::verification_only();
+        let unauth_bundle = unauthed.transparent_bundle().expect("transparent bundle");
+        assert_eq!(authorized.vin.len(), inputs.len());
+        for (index, txin) in authorized.vin.iter().enumerate() {
+            let script = inputs[index].coin().script_pubkey();
+            let signable = transparent::sighash::SignableInput::from_parts(
+                unauth_bundle,
+                transparent::sighash::SighashType::ALL,
+                index,
+                script,
+                script,
+                inputs[index].coin().value(),
+            )
+            .expect("sighash input");
+            let sighash = signature_hash(
+                &unauthed,
+                &SignableInput::Transparent(signable),
+                &txid_parts,
+            );
+            let bytes = txin.script_sig().0.to_bytes();
+            let sig_len = bytes[0] as usize;
+            let pushed = &bytes[1..1 + sig_len];
+            let signature = secp256k1::ecdsa::Signature::from_der(&pushed[..pushed.len() - 1])
+                .expect("DER signature");
+            verify
+                .verify_ecdsa(
+                    &Message::from_digest(*sighash.as_ref()),
+                    &signature,
+                    &pubkey,
+                )
+                .expect("signature verifies");
+        }
+    }
 }

@@ -2500,7 +2500,6 @@ dependencies = [
  "rand",
  "sapling-crypto",
  "secp256k1",
- "secrecy",
  "serde",
  "serde_json",
  "sev",

@@ -80,7 +80,7 @@ Restart continues from the persisted state:
 - `SEALED` requests and verifies attestation when it is not already stored, then waits for funding.
 - `WAITING_FOR_FUNDS` resumes the funding wait.
 - `FUNDED` constructs the anchor.
-- `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it.
+- `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it. If Zebra reports that the stored transaction expired before it was accepted, the ceremony returns to `FUNDED` and builds a new anchor at the current tip.
 - `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction.
 - `COMPLETE` exits successfully.
 

@@ -203,6 +203,24 @@ impl CeremonyState {
         self
     }
 
+    /// Drop an unbroadcast anchor whose expiry has passed and build another.
+    ///
+    /// `FUNDED` resumes at `BuildAnchor`, which unseals the same capsule and
+    /// constructs a transaction at the current tip.
+    pub fn expired_anchor(mut self) -> Self {
+        assert_eq!(
+            self.phase,
+            Phase::AnchorBuilt,
+            "only ANCHOR_BUILT can expire"
+        );
+
+        self.phase = Phase::Funded;
+        self.txid = None;
+        self.raw_tx = None;
+        self.birthday = None;
+        self
+    }
+
     pub fn anchor_broadcast(mut self, birthday: u32) -> Self {
         assert!(
             self.txid.is_some(),
@@ -477,6 +495,18 @@ mod tests {
 
         let complete = broadcast.complete();
         assert_eq!(complete.resume_action(), ResumeAction::Done);
+    }
+
+    #[test]
+    fn expired_anchor_returns_to_funded_without_the_old_transaction() {
+        let expired = sealed_state()
+            .anchor_built("ab".repeat(32), "00ff".to_string())
+            .expired_anchor();
+        assert_eq!(expired.phase(), Phase::Funded);
+        assert_eq!(expired.resume_action(), ResumeAction::BuildAnchor);
+        assert_eq!(expired.txid(), None);
+        assert_eq!(expired.raw_tx(), None);
+        assert_eq!(expired.birthday(), None);
     }
 
     #[test]

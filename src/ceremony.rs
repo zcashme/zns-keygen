@@ -17,8 +17,8 @@ use zcash_address::ZcashAddress;
 use zcash_protocol::consensus::Parameters;
 
 use crate::NETWORK;
-use crate::fingerprint::SeedFingerprint;
 use crate::keys::TreasuryFundingInfo;
+use zip32::fingerprint::SeedFingerprint;
 
 pub const STATE_FILE: &str = "keys/ceremony_state.toml";
 

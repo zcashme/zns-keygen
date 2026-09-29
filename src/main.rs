@@ -1,19 +1,13 @@
 //! zns-keygen — ZNS mint key genesis ceremony.
 
 mod anchor;
-mod attestation;
 mod ceremony;
-mod fingerprint;
 mod keys;
 mod rpc;
 
 use blake2b_simd::Params as Blake2bParams;
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, Payload},
-};
-#[cfg(target_os = "linux")]
-use sev::firmware::guest::{DerivedKey, Firmware, GuestFieldSelect};
+use rand::RngCore;
+use secrecy::{ExposeSecret, Secret};
 use std::fs::{self, File, OpenOptions};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use std::hint::spin_loop;
@@ -23,9 +17,11 @@ use std::path::Path;
 use std::time::Duration;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
+use zip32::fingerprint::SeedFingerprint;
+use zns_canon::capsule::{self, MAGIC as CAPSULE_MAGIC, SEED_LEN};
+use zns_canon::sealing::RealSnpTee;
 
-use fingerprint::SeedFingerprint;
 use keys::{AnchorMaterial, TreasuryFundingInfo};
 
 const KEYS_DIR: &str = "keys";
@@ -34,24 +30,8 @@ const MANIFEST_FILE: &str = "keys/zns_custody_manifest.toml";
 const MINT_CONFIG_FILE: &str = "keys/zns_mint.conf";
 const ATTESTATION_FILE: &str = "keys/zns_attestation.bin";
 
-const REPORT_DATA_LEN: usize = 64;
 const TREASURY_ACCOUNT: u32 = 0;
 const REGISTRY_ACCOUNT: u32 = 1;
-const SEED_LEN: usize = 32;
-const FINGERPRINT_LEN: usize = 32;
-const SEALING_KEY_LEN: usize = 32;
-const NONCE_LEN: usize = 24;
-const TAG_LEN: usize = 16;
-const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
-const CAPSULE_MAGIC: [u8; 8] = *b"ZNS_SEED";
-
-const _: () = assert!(SEED_LEN >= 32);
-const _: () = assert!(SEED_LEN <= 252);
-const _: () = assert!(FINGERPRINT_LEN == 32);
-const _: () = assert!(SEALING_KEY_LEN == 32);
-const _: () = assert!(NONCE_LEN == 24);
-const _: () = assert!(TAG_LEN == 16);
-const _: () = assert!(CIPHERTEXT_LEN == SEED_LEN + TAG_LEN);
 
 #[cfg(not(feature = "testnet"))]
 type Network = zcash_protocol::consensus::MainNetwork;
@@ -168,21 +148,22 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
     ensure_absent(state_path);
 
     let (fingerprint, capsule_hash, funding) = {
-        let seed = Seed::generate();
-        let fingerprint = seed.fingerprint();
+        let seed = generate_seed();
+        let fingerprint =
+            SeedFingerprint::from_seed(seed.expose_secret()).expect("FATAL: seed length");
         tracing::info!("seed fingerprint: {fingerprint}");
 
-        let funding = seed.expose(|seed_bytes| TreasuryFundingInfo::derive(&NETWORK, seed_bytes));
+        let funding = TreasuryFundingInfo::derive(&NETWORK, seed.expose_secret());
 
         tracing::info!("=== SEALING ===");
-        let sealing_key = derive_sealing_key();
-        let capsule = seal_seed(&seed, &sealing_key, fingerprint);
-        let capsule_bytes = postcard::to_allocvec(&capsule).expect("FATAL: serialize capsule");
+        let capsule = capsule::seal_seed(&RealSnpTee, &seed, &mut RdseedRng)
+            .unwrap_or_else(|error| panic!("FATAL: seal capsule: {error}"));
+        let capsule_bytes = capsule::serialize_capsule(&capsule)
+            .unwrap_or_else(|error| panic!("FATAL: serialize capsule: {error}"));
         let capsule_hash = blake2b256(&capsule_bytes);
         write_secret_file(capsule_path, &capsule_bytes);
         tracing::info!("capsule persisted; dropping plaintext seed");
         drop(seed);
-        drop(sealing_key);
         (fingerprint, capsule_hash, funding)
     };
 
@@ -204,19 +185,19 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
 
 fn attest(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::CeremonyState {
     let attestation_path = Path::new(ATTESTATION_FILE);
-    let expected = attestation::report_data(state.fingerprint(), state.capsule_hash());
+    let expected = zns_canon::attestation::report_data(state.fingerprint(), state.capsule_hash());
     match fs::symlink_metadata(attestation_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             panic!("FATAL: {} is a symlink", attestation_path.display());
         }
         Ok(_) => {
             let bytes = fs::read(attestation_path).expect("FATAL: read attestation");
-            let _checked = attestation::stored(bytes, &expected);
+            let _checked = zns_canon::attestation::stored(bytes, &expected);
             tracing::info!("attestation already persisted");
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("=== ATTESTATION ===");
-            let attestation = attestation::request(&expected);
+            let attestation = zns_canon::attestation::request(&expected);
             write_atomic(attestation_path, &attestation.report_bytes, 0o644);
             tracing::info!("attestation persisted");
         }
@@ -258,12 +239,15 @@ fn build_anchor(
     let inputs = poll_until_funded(&funding);
     let fingerprint = *state.fingerprint();
 
-    let sealing_key = derive_sealing_key();
-    let capsule = read_capsule(capsule_path);
-    let seed = unseal_seed(&capsule, &sealing_key).expect("FATAL: unseal capsule");
+    let capsule_bytes = capsule::read_capsule_file(capsule_path)
+        .unwrap_or_else(|error| panic!("FATAL: read capsule: {error}"));
+    let capsule = capsule::parse_capsule(&capsule_bytes)
+        .unwrap_or_else(|error| panic!("FATAL: parse capsule: {error}"));
+    let seed = capsule::unseal_seed(&RealSnpTee, &capsule)
+        .unwrap_or_else(|error| panic!("FATAL: unseal capsule: {error}"));
+    let unsealed = SeedFingerprint::from_seed(seed.expose_secret()).expect("FATAL: seed length");
     assert_eq!(
-        seed.fingerprint(),
-        fingerprint,
+        unsealed, fingerprint,
         "FATAL: unsealed seed fingerprint does not match the ceremony fingerprint"
     );
 
@@ -271,9 +255,8 @@ fn build_anchor(
     let (tip_height, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
     tracing::info!(height = u32::from(tip_height), "chain tip");
 
-    let mut material = seed.expose(|seed_bytes| AnchorMaterial::derive(&NETWORK, seed_bytes));
+    let mut material = AnchorMaterial::derive(&NETWORK, seed.expose_secret());
     drop(seed);
-    drop(sealing_key);
 
     let tx = anchor::build_anchor_transaction(
         &NETWORK,
@@ -497,10 +480,10 @@ fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Cere
             .birthday()
             .expect("FATAL: broadcast anchor has no birthday"),
     );
-    let expected = attestation::report_data(&fingerprint, &capsule_hash);
+    let expected = zns_canon::attestation::report_data(&fingerprint, &capsule_hash);
     let report_bytes =
         fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
-    let attestation = attestation::stored(report_bytes, &expected);
+    let attestation = zns_canon::attestation::stored(report_bytes, &expected);
     let report_data_hash = blake2b256(&expected);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
@@ -602,145 +585,6 @@ fn utxo_to_input(
         transparent::builder::SpendInfo::P2pkh { pubkey },
     )
     .expect("FATAL: transparent input")
-}
-
-// ── Seed ──────────────────────────────────────────────────────────
-
-struct Seed(Zeroizing<[u8; SEED_LEN]>);
-
-impl Seed {
-    fn generate() -> Seed {
-        let mut seed = Seed(Zeroizing::new([0u8; SEED_LEN]));
-        fill_entropy(&mut seed.0[..]);
-        assert!(!seed.0.iter().all(|&b| b == 0), "RDSEED all zeros");
-        assert!(!seed.0.iter().all(|&b| b == 0xff), "RDSEED all 0xFF");
-        seed
-    }
-
-    fn expose<R>(&self, f: impl FnOnce(&[u8; SEED_LEN]) -> R) -> R {
-        f(&self.0)
-    }
-
-    fn fingerprint(&self) -> SeedFingerprint {
-        self.expose(|s| SeedFingerprint::from_seed(s).expect("SEED_LEN const-asserted"))
-    }
-
-    fn from_bytes(bytes: [u8; SEED_LEN]) -> Seed {
-        Seed(Zeroizing::new(bytes))
-    }
-}
-
-// ── Sealing key ───────────────────────────────────────────────────
-
-struct SealingKey(Zeroizing<[u8; SEALING_KEY_LEN]>);
-
-impl SealingKey {
-    fn as_bytes(&self) -> &[u8; SEALING_KEY_LEN] {
-        &self.0
-    }
-
-    #[cfg(test)]
-    fn from_bytes(bytes: [u8; SEALING_KEY_LEN]) -> Self {
-        SealingKey(Zeroizing::new(bytes))
-    }
-}
-
-// ── Capsule ───────────────────────────────────────────────────────
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct SeedCapsule {
-    magic: [u8; 8],
-    fingerprint: [u8; FINGERPRINT_LEN],
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-}
-
-fn seal_seed(seed: &Seed, sealing_key: &SealingKey, fingerprint: SeedFingerprint) -> SeedCapsule {
-    let mut nonce = [0u8; NONCE_LEN];
-    fill_entropy(&mut nonce);
-    let capsule = seal_seed_with_nonce(seed, sealing_key, fingerprint, nonce);
-    nonce.zeroize();
-    capsule
-}
-
-fn seal_seed_with_nonce(
-    seed: &Seed,
-    sealing_key: &SealingKey,
-    fingerprint: SeedFingerprint,
-    nonce: [u8; NONCE_LEN],
-) -> SeedCapsule {
-    let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
-        .expect("key length const-asserted");
-    let aad = capsule_aad(fingerprint);
-    let nonce_ref = <&XNonce>::from(nonce.as_slice());
-    let ciphertext = seed
-        .expose(|s| cipher.encrypt(nonce_ref, Payload { msg: s, aad: &aad }))
-        .expect("FATAL: encrypt seed");
-    assert_eq!(ciphertext.len(), CIPHERTEXT_LEN);
-    SeedCapsule {
-        magic: CAPSULE_MAGIC,
-        fingerprint: fingerprint.to_bytes(),
-        nonce: nonce.to_vec(),
-        ciphertext,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum UnsealError {
-    InvalidMagic,
-    InvalidNonce,
-    AuthenticationFailed,
-    InvalidSeedLength,
-    FingerprintMismatch,
-}
-
-/// Inverse of `seal_seed`: decrypt the capsule and require the ZIP-32 fingerprint to match.
-fn unseal_seed(capsule: &SeedCapsule, sealing_key: &SealingKey) -> Result<Seed, UnsealError> {
-    if capsule.magic != CAPSULE_MAGIC {
-        return Err(UnsealError::InvalidMagic);
-    }
-    if capsule.nonce.len() != NONCE_LEN {
-        return Err(UnsealError::InvalidNonce);
-    }
-    let fingerprint = SeedFingerprint::from_bytes(capsule.fingerprint);
-    let aad = capsule_aad(fingerprint);
-    let cipher = XChaCha20Poly1305::new_from_slice(sealing_key.as_bytes())
-        .expect("key length const-asserted");
-    let nonce_ref = <&XNonce>::from(capsule.nonce.as_slice());
-    let mut plaintext = cipher
-        .decrypt(
-            nonce_ref,
-            Payload {
-                msg: &capsule.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| UnsealError::AuthenticationFailed)?;
-    if plaintext.len() != SEED_LEN {
-        plaintext.zeroize();
-        return Err(UnsealError::InvalidSeedLength);
-    }
-    let mut seed_bytes = [0u8; SEED_LEN];
-    seed_bytes.copy_from_slice(&plaintext);
-    plaintext.zeroize();
-    let seed = Seed::from_bytes(seed_bytes);
-    seed_bytes.zeroize();
-    if seed.fingerprint() != fingerprint {
-        return Err(UnsealError::FingerprintMismatch);
-    }
-    Ok(seed)
-}
-
-fn read_capsule(path: &Path) -> SeedCapsule {
-    let bytes = fs::read(path).expect("FATAL: read capsule");
-    postcard::from_bytes(&bytes).expect("FATAL: deserialize capsule")
-}
-
-fn capsule_aad(fingerprint: SeedFingerprint) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(CAPSULE_MAGIC.len() + FINGERPRINT_LEN);
-    aad.extend_from_slice(&CAPSULE_MAGIC);
-    aad.extend_from_slice(&fingerprint.to_bytes());
-    aad
 }
 
 // ── Manifest ──────────────────────────────────────────────────────
@@ -878,26 +722,47 @@ fn fill_entropy(dest: &mut [u8]) {
         .expect("FATAL: entropy unavailable");
 }
 
-// ── Sealing key derivation ────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-fn derive_sealing_key() -> SealingKey {
-    let mut firmware = Firmware::open().expect("FATAL: open /dev/sev-guest");
-    let mut gf = GuestFieldSelect::default();
-    gf.set_guest_policy(true);
-    gf.set_measurement(true);
-    let request = DerivedKey::new(false, gf, 0, 0, 0, None);
-    let mut key = firmware
-        .get_derived_key(Some(1), request)
-        .expect("FATAL: derive SEV-SNP sealing key");
-    let sk = SealingKey(Zeroizing::new(key));
-    key.zeroize();
-    sk
+/// Draws the ceremony seed from RDSEED and rejects a degenerate output.
+fn generate_seed() -> Secret<[u8; SEED_LEN]> {
+    let mut seed_bytes = [0u8; SEED_LEN];
+    fill_entropy(&mut seed_bytes);
+    assert!(
+        !seed_bytes.iter().all(|&b| b == 0),
+        "FATAL: RDSEED all zeros"
+    );
+    assert!(
+        !seed_bytes.iter().all(|&b| b == 0xff),
+        "FATAL: RDSEED all 0xFF"
+    );
+    let seed = Secret::new(seed_bytes);
+    seed_bytes.zeroize();
+    seed
 }
 
-#[cfg(not(target_os = "linux"))]
-fn derive_sealing_key() -> SealingKey {
-    SealingKey(Zeroizing::new([0u8; SEALING_KEY_LEN]))
+/// Nonce source for capsule sealing. The seed itself is drawn separately.
+struct RdseedRng;
+
+impl RngCore for RdseedRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut bytes = [0u8; 4];
+        self.fill_bytes(&mut bytes);
+        u32::from_ne_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_ne_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fill_entropy(dest);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
 }
 
 // ── File I/O ──────────────────────────────────────────────────────
@@ -1033,129 +898,6 @@ mod tests {
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
         assert_eq!(fp.to_bytes(), expected);
-    }
-
-    fn test_seed_and_key() -> (Seed, SealingKey, SeedFingerprint) {
-        let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ];
-        let seed = Seed::from_bytes(seed_bytes);
-        let fingerprint = seed.fingerprint();
-        let key = SealingKey::from_bytes([0x42; SEALING_KEY_LEN]);
-        (seed, key, fingerprint)
-    }
-
-    fn roundtrip_capsule(
-        seed: &Seed,
-        key: &SealingKey,
-        fingerprint: SeedFingerprint,
-    ) -> SeedCapsule {
-        let capsule = seal_seed_with_nonce(seed, key, fingerprint, [0x11; NONCE_LEN]);
-        let bytes = postcard::to_allocvec(&capsule).unwrap();
-        postcard::from_bytes(&bytes).unwrap()
-    }
-
-    #[test]
-    fn seal_serialize_deserialize_unseal_returns_original_seed() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let decoded = roundtrip_capsule(&seed, &key, fingerprint);
-        let opened = unseal_seed(&decoded, &key).unwrap();
-        seed.expose(|original| {
-            opened.expose(|recovered| assert_eq!(original, recovered));
-        });
-    }
-
-    #[test]
-    fn modified_ciphertext_fails_authentication() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let mut capsule = roundtrip_capsule(&seed, &key, fingerprint);
-        capsule.ciphertext[0] ^= 0x01;
-        assert!(matches!(
-            unseal_seed(&capsule, &key),
-            Err(UnsealError::AuthenticationFailed)
-        ));
-    }
-
-    #[test]
-    fn modified_nonce_fails_authentication() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let mut capsule = roundtrip_capsule(&seed, &key, fingerprint);
-        capsule.nonce[0] ^= 0x01;
-        assert!(matches!(
-            unseal_seed(&capsule, &key),
-            Err(UnsealError::AuthenticationFailed)
-        ));
-    }
-
-    #[test]
-    fn modified_fingerprint_fails_authentication() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let mut capsule = roundtrip_capsule(&seed, &key, fingerprint);
-        capsule.fingerprint[0] ^= 0x01;
-        assert!(matches!(
-            unseal_seed(&capsule, &key),
-            Err(UnsealError::AuthenticationFailed)
-        ));
-    }
-
-    #[test]
-    fn invalid_capsule_magic_is_rejected() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let mut capsule = roundtrip_capsule(&seed, &key, fingerprint);
-        capsule.magic = *b"NOT_SEED";
-        assert!(matches!(
-            unseal_seed(&capsule, &key),
-            Err(UnsealError::InvalidMagic)
-        ));
-    }
-
-    #[test]
-    fn fingerprint_mismatch_after_decrypt_is_rejected() {
-        let (seed, key, _) = test_seed_and_key();
-        let other = SeedFingerprint::from_bytes([0xAB; FINGERPRINT_LEN]);
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes()).unwrap();
-        let nonce = [0x22; NONCE_LEN];
-        let aad = capsule_aad(other);
-        let nonce_ref = <&XNonce>::from(nonce.as_slice());
-        let ciphertext = seed
-            .expose(|s| cipher.encrypt(nonce_ref, Payload { msg: s, aad: &aad }))
-            .unwrap();
-        let capsule = SeedCapsule {
-            magic: CAPSULE_MAGIC,
-            fingerprint: other.to_bytes(),
-            nonce: nonce.to_vec(),
-            ciphertext,
-        };
-        assert!(matches!(
-            unseal_seed(&capsule, &key),
-            Err(UnsealError::FingerprintMismatch)
-        ));
-    }
-
-    #[test]
-    fn postcard_capsule_layout_matches_documented_fields() {
-        let (seed, key, fingerprint) = test_seed_and_key();
-        let capsule = seal_seed_with_nonce(&seed, &key, fingerprint, [0x11; NONCE_LEN]);
-        let bytes = postcard::to_allocvec(&capsule).unwrap();
-        assert_eq!(&bytes[0..8], b"ZNS_SEED");
-        assert_eq!(&bytes[8..40], &fingerprint.to_bytes());
-        assert_eq!(bytes[40], NONCE_LEN as u8);
-        assert_eq!(bytes[41 + NONCE_LEN], CIPHERTEXT_LEN as u8);
-    }
-
-    #[test]
-    fn capsule_serializes_with_postcard() {
-        let capsule = SeedCapsule {
-            magic: CAPSULE_MAGIC,
-            fingerprint: [0xAA; FINGERPRINT_LEN],
-            nonce: vec![0xBB; NONCE_LEN],
-            ciphertext: vec![0xCC; CIPHERTEXT_LEN],
-        };
-        let bytes = postcard::to_allocvec(&capsule).unwrap();
-        let decoded: SeedCapsule = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.magic, CAPSULE_MAGIC);
     }
 
     #[test]

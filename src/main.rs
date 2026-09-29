@@ -150,6 +150,7 @@ fn run_ceremony() {
             ceremony::ResumeAction::WaitForFunding => wait_for_funding(state, state_path),
             ceremony::ResumeAction::BuildAnchor => build_anchor(state, state_path, capsule_path),
             ceremony::ResumeAction::ResolveBroadcast => resolve_broadcast(state, state_path),
+            ceremony::ResumeAction::WaitForConfirmation => wait_for_confirmation(state, state_path),
             ceremony::ResumeAction::Finalize => finalize(state, state_path),
             ceremony::ResumeAction::Done => {
                 tracing::info!("=== CEREMONY COMPLETE ===");
@@ -301,57 +302,190 @@ fn resolve_broadcast(state: ceremony::CeremonyState, state_path: &Path) -> cerem
         .txid()
         .expect("FATAL: built anchor has no txid")
         .to_string();
-    let presence = rpc::Rpc::transaction_presence(&txid).unwrap_or_else(|error| {
-        panic!("FATAL: could not determine whether {txid} was broadcast: {error}")
-    });
-    let presence = match presence {
-        rpc::TxLookup::Absent => ceremony::TxPresence::Absent,
-        rpc::TxLookup::Present { height } => ceremony::TxPresence::Present { height },
-    };
-    let (tip, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
-    let birthday = match ceremony::broadcast_action(presence, u32::from(tip)) {
-        ceremony::BroadcastAction::SendStored => {
-            let raw_tx = state
-                .raw_tx()
-                .expect("FATAL: built anchor has no raw transaction")
-                .to_string();
-            tracing::info!(txid, "broadcasting stored anchor");
-            let sent = match rpc::Rpc::send_raw(&raw_tx) {
-                Ok(txid) => txid,
-                Err(error)
-                    if error
-                        .to_ascii_lowercase()
-                        .contains("greater than its expiry") =>
-                {
-                    tracing::warn!(txid, "stored anchor expired before broadcast; rebuilding");
-
-                    let state = state.expired_anchor();
-                    ceremony::store(state_path, &state);
-
-                    tracing::info!(
-                        phase = %state.phase(),
-                        "expired anchor discarded; rebuilding from funded state"
-                    );
-
-                    return state;
+    loop {
+        let lookup = anchor_lookup(&txid);
+        match ceremony::broadcast_action(lookup) {
+            ceremony::BroadcastAction::SendStored => {
+                match lookup {
+                    ceremony::AnchorLookup::SideChain => tracing::info!(
+                        txid,
+                        "stored anchor is on a side chain; rebroadcasting the same transaction"
+                    ),
+                    _ => tracing::info!(txid, "broadcasting stored anchor"),
                 }
-                Err(error) => panic!("FATAL: sendrawtransaction: {error}"),
-            };
+                match submit_stored_anchor(&state, state_path, &txid) {
+                    StoredSubmit::Accepted => return record_submitted(state, state_path, &txid),
+                    StoredSubmit::Expired(state) => return state,
+                    StoredSubmit::Rejected => std::thread::sleep(POLL_INTERVAL),
+                }
+            }
+            ceremony::BroadcastAction::AwaitConfirmation => {
+                tracing::info!(txid, "stored anchor is known; waiting for confirmation");
+                return record_submitted(state, state_path, &txid);
+            }
+            ceremony::BroadcastAction::Confirmed { birthday } => {
+                return record_confirmed(state, state_path, &txid, birthday);
+            }
+        }
+    }
+}
+
+/// Poll until the stored anchor's best-chain inclusion can be the birthday.
+///
+/// A restart stays on this transaction. The chain tip is not a birthday. An
+/// RPC failure or a mempool entry leaves the ceremony pending. A side-chain
+/// result is submitted again: Zebra can put that same transaction back in the
+/// mempool, or reject it as expired so the ceremony builds a replacement.
+fn wait_for_confirmation(
+    state: ceremony::CeremonyState,
+    state_path: &Path,
+) -> ceremony::CeremonyState {
+    let txid = state
+        .txid()
+        .expect("FATAL: submitted anchor has no txid")
+        .to_string();
+    loop {
+        let lookup = anchor_lookup(&txid);
+        match ceremony::broadcast_action(lookup) {
+            ceremony::BroadcastAction::SendStored => {
+                match lookup {
+                    ceremony::AnchorLookup::SideChain => tracing::warn!(
+                        txid,
+                        "stored anchor is on a side chain; rebroadcasting the same transaction"
+                    ),
+                    _ => tracing::warn!(
+                        txid,
+                        "stored anchor is not in the mempool or best chain; rebroadcasting the same transaction"
+                    ),
+                }
+                match submit_stored_anchor(&state, state_path, &txid) {
+                    StoredSubmit::Accepted => {
+                        tracing::info!(
+                            txid,
+                            "same anchor rebroadcast; still waiting for inclusion"
+                        );
+                    }
+                    StoredSubmit::Expired(state) => return state,
+                    StoredSubmit::Rejected => {}
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            ceremony::BroadcastAction::AwaitConfirmation => {
+                let ceremony::AnchorLookup::Pending {
+                    height,
+                    confirmations,
+                } = lookup
+                else {
+                    panic!("FATAL: confirmation wait expected a pending anchor observation");
+                };
+                tracing::info!(
+                    txid,
+                    ?height,
+                    ?confirmations,
+                    required = ceremony::ANCHOR_CONFIRMATIONS,
+                    "anchor not yet confirmed"
+                );
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            ceremony::BroadcastAction::Confirmed { birthday } => {
+                return record_confirmed(state, state_path, &txid, birthday);
+            }
+        }
+    }
+}
+
+fn anchor_lookup(txid: &str) -> ceremony::AnchorLookup {
+    loop {
+        match rpc::Rpc::transaction_presence(txid) {
+            Ok(rpc::TxLookup::Absent) => return ceremony::AnchorLookup::Absent,
+            Ok(rpc::TxLookup::Found {
+                height,
+                confirmations,
+            }) => return ceremony::classify_anchor(height, confirmations),
+            Err(error) => {
+                tracing::warn!(%error, txid, "anchor lookup failed; retrying");
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+enum StoredSubmit {
+    Accepted,
+    Expired(ceremony::CeremonyState),
+    /// Zebra answered, but did not accept the transaction. Look it up again.
+    Rejected,
+}
+
+/// Submit the stored raw transaction and no other.
+///
+/// An expiry rejection is the only reason to discard it. Any other RPC failure
+/// stays on this transaction.
+fn submit_stored_anchor(
+    state: &ceremony::CeremonyState,
+    state_path: &Path,
+    txid: &str,
+) -> StoredSubmit {
+    let raw_tx = state
+        .raw_tx()
+        .expect("FATAL: stored anchor has no raw transaction")
+        .to_string();
+    match rpc::Rpc::send_raw(&raw_tx) {
+        Ok(sent) => {
             if sent != txid {
                 panic!("FATAL: broadcast txid {sent} does not match stored {txid}");
             }
-            let (birthday, _) = rpc::Rpc::tip().expect("FATAL: Zebra unreachable");
-            tracing::info!(txid, height = u32::from(birthday), "anchor tx broadcast");
-            u32::from(birthday)
+            StoredSubmit::Accepted
         }
-        ceremony::BroadcastAction::Recorded { birthday } => {
-            tracing::info!(txid, birthday, "anchor already broadcast; not rebuilding");
-            birthday
+        Err(error) if rpc::transaction_is_expired(&error) => {
+            tracing::warn!(
+                txid,
+                "stored anchor expired before it was mined; rebuilding"
+            );
+            let state = state.clone().expired_anchor();
+            ceremony::store(state_path, &state);
+            tracing::info!(
+                phase = %state.phase(),
+                "expired anchor discarded; rebuilding from funded state"
+            );
+            StoredSubmit::Expired(state)
         }
-    };
+        Err(error) => {
+            tracing::warn!(%error, txid, "broadcast of stored anchor failed; retrying");
+            StoredSubmit::Rejected
+        }
+    }
+}
+
+fn record_submitted(
+    state: ceremony::CeremonyState,
+    state_path: &Path,
+    txid: &str,
+) -> ceremony::CeremonyState {
+    let state = state.anchor_submitted();
+    ceremony::store(state_path, &state);
+    tracing::info!(
+        phase = %state.phase(),
+        txid,
+        "anchor submitted; birthday waits for best-chain confirmation"
+    );
+    state
+}
+
+fn record_confirmed(
+    state: ceremony::CeremonyState,
+    state_path: &Path,
+    txid: &str,
+    birthday: u32,
+) -> ceremony::CeremonyState {
     let state = state.anchor_broadcast(birthday);
     ceremony::store(state_path, &state);
-    tracing::info!(phase = %state.phase(), txid, birthday, "ceremony state persisted");
+    tracing::info!(
+        phase = %state.phase(),
+        txid,
+        birthday,
+        "anchor confirmed; birthday is its best-chain inclusion height"
+    );
     state
 }
 

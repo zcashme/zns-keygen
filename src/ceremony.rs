@@ -2,8 +2,10 @@
 //!
 //! The capsule is written before this state file. Every later transition is
 //! recorded here before the next irreversible step. `ANCHOR_BUILT` stores the
-//! signed transaction before broadcast. `ANCHOR_BROADCAST` stores the txid and
-//! birthday immediately after broadcast and never builds or submits another.
+//! signed transaction before broadcast. `ANCHOR_SUBMITTED` keeps that same
+//! transaction while it waits for [`ANCHOR_CONFIRMATIONS`] on the best chain.
+//! `ANCHOR_BROADCAST` stores the txid and the inclusion height only after that
+//! depth, and never builds or submits another.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -24,8 +26,17 @@ const SEALED: &str = "SEALED";
 const WAITING_FOR_FUNDS: &str = "WAITING_FOR_FUNDS";
 const FUNDED: &str = "FUNDED";
 const ANCHOR_BUILT: &str = "ANCHOR_BUILT";
+const ANCHOR_SUBMITTED: &str = "ANCHOR_SUBMITTED";
 const ANCHOR_BROADCAST: &str = "ANCHOR_BROADCAST";
 const COMPLETE: &str = "COMPLETE";
+
+/// Best-chain confirmations required before the inclusion height becomes the birthday.
+///
+/// One confirmation shows that the anchor entered a block. That block can still
+/// be reorged, so it is not the birthday. Ten confirmations is the depth at
+/// which this ceremony treats the inclusion height as fixed. The birthday is
+/// that block's height, not the chain tip and not the height plus this depth.
+pub const ANCHOR_CONFIRMATIONS: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -33,6 +44,7 @@ pub enum Phase {
     WaitingForFunds,
     Funded,
     AnchorBuilt,
+    AnchorSubmitted,
     AnchorBroadcast,
     Complete,
 }
@@ -44,6 +56,7 @@ impl Phase {
             Phase::WaitingForFunds => WAITING_FOR_FUNDS,
             Phase::Funded => FUNDED,
             Phase::AnchorBuilt => ANCHOR_BUILT,
+            Phase::AnchorSubmitted => ANCHOR_SUBMITTED,
             Phase::AnchorBroadcast => ANCHOR_BROADCAST,
             Phase::Complete => COMPLETE,
         }
@@ -55,6 +68,7 @@ impl Phase {
             WAITING_FOR_FUNDS => Some(Phase::WaitingForFunds),
             FUNDED => Some(Phase::Funded),
             ANCHOR_BUILT => Some(Phase::AnchorBuilt),
+            ANCHOR_SUBMITTED => Some(Phase::AnchorSubmitted),
             ANCHOR_BROADCAST => Some(Phase::AnchorBroadcast),
             COMPLETE => Some(Phase::Complete),
             _ => None,
@@ -79,44 +93,76 @@ pub enum ResumeAction {
     BuildAnchor,
     /// The signed anchor is stored. Learn whether it was broadcast before sending.
     ResolveBroadcast,
+    /// The stored anchor was submitted. Wait until its best-chain inclusion is confirmed.
+    WaitForConfirmation,
     /// Txid and birthday are durable. Write the manifest and mint config only.
     Finalize,
     /// Ceremony finished. Exit successfully.
     Done,
 }
 
-/// Whether the stored anchor txid is already known to the node.
+/// What a lookup of the stored anchor txid means for the birthday.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TxPresence {
+pub enum AnchorLookup {
+    /// The node does not have this txid in the mempool or the best chain.
     Absent,
-    /// `height` is set once the transaction is in a block.
-    Present {
-        height: Option<u32>,
+    /// In the mempool, or mined on the best chain with fewer than [`ANCHOR_CONFIRMATIONS`].
+    ///
+    /// `height` is missing for a mempool transaction. `confirmations` is missing
+    /// or still below the required depth.
+    Pending {
+        height: Option<i64>,
+        confirmations: Option<u64>,
     },
+    /// Zebra still has the transaction, but only on a side chain.
+    ///
+    /// A negative height, including `-1`, is not a mining candidate. The stored
+    /// transaction has to be submitted again so the node can accept it into the
+    /// mempool or reject it as expired.
+    SideChain,
+    /// Best-chain block that contains the anchor, after [`ANCHOR_CONFIRMATIONS`].
+    Confirmed { birthday: u32 },
 }
 
-/// The only two outcomes of `ANCHOR_BUILT`.
+/// The next step for a stored anchor. None of these builds a different transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BroadcastAction {
     /// The txid is unknown. Submit the stored raw transaction and no other.
     SendStored,
-    /// The txid is already known. Do not build or submit another transaction.
-    Recorded { birthday: u32 },
+    /// The txid is known, but its birthday is not confirmed. Do not finalize.
+    AwaitConfirmation,
+    /// The inclusion height is confirmed. Persist it and finalize.
+    Confirmed { birthday: u32 },
+}
+
+/// Classify a verbose `getrawtransaction` result.
+///
+/// A missing height, a missing confirmation count, or fewer than
+/// [`ANCHOR_CONFIRMATIONS`] stays pending. A negative height is a side chain.
+/// The chain tip is not an input.
+pub fn classify_anchor(height: Option<i64>, confirmations: Option<u64>) -> AnchorLookup {
+    if matches!(height, Some(height) if height < 0) {
+        return AnchorLookup::SideChain;
+    }
+    if let (Some(height), Some(confirmations)) = (height, confirmations)
+        && height >= 0
+        && confirmations >= u64::from(ANCHOR_CONFIRMATIONS)
+        && let Ok(birthday) = u32::try_from(height)
+    {
+        return AnchorLookup::Confirmed { birthday };
+    }
+    AnchorLookup::Pending {
+        height,
+        confirmations,
+    }
 }
 
 /// Decide the broadcast step from a lookup that has already been performed.
-///
-/// `tip_height` is the birthday only when the transaction is known but not yet
-/// in a block. A known block height is kept as the birthday.
-pub fn broadcast_action(presence: TxPresence, tip_height: u32) -> BroadcastAction {
-    match presence {
-        TxPresence::Absent => BroadcastAction::SendStored,
-        TxPresence::Present {
-            height: Some(height),
-        } => BroadcastAction::Recorded { birthday: height },
-        TxPresence::Present { height: None } => BroadcastAction::Recorded {
-            birthday: tip_height,
-        },
+pub fn broadcast_action(lookup: AnchorLookup) -> BroadcastAction {
+    match lookup {
+        AnchorLookup::Absent | AnchorLookup::SideChain => BroadcastAction::SendStored,
+        AnchorLookup::Pending { .. } => BroadcastAction::AwaitConfirmation,
+        AnchorLookup::Confirmed { birthday } => BroadcastAction::Confirmed { birthday },
     }
 }
 
@@ -181,6 +227,7 @@ impl CeremonyState {
             Phase::WaitingForFunds => ResumeAction::WaitForFunding,
             Phase::Funded => ResumeAction::BuildAnchor,
             Phase::AnchorBuilt => ResumeAction::ResolveBroadcast,
+            Phase::AnchorSubmitted => ResumeAction::WaitForConfirmation,
             Phase::AnchorBroadcast => ResumeAction::Finalize,
             Phase::Complete => ResumeAction::Done,
         }
@@ -203,20 +250,35 @@ impl CeremonyState {
         self
     }
 
-    /// Drop an unbroadcast anchor whose expiry has passed and build another.
+    /// Drop a stored anchor whose expiry has passed and build another.
     ///
-    /// `FUNDED` resumes at `BuildAnchor`, which unseals the same capsule and
-    /// constructs a transaction at the current tip.
+    /// This is only for the transaction already stored in `ANCHOR_BUILT` or
+    /// `ANCHOR_SUBMITTED`. `FUNDED` resumes at `BuildAnchor`, which unseals the
+    /// same capsule and constructs one replacement at the current tip.
     pub fn expired_anchor(mut self) -> Self {
-        assert_eq!(
-            self.phase,
-            Phase::AnchorBuilt,
-            "only ANCHOR_BUILT can expire"
+        assert!(
+            matches!(self.phase, Phase::AnchorBuilt | Phase::AnchorSubmitted),
+            "only an unconfirmed stored anchor can expire"
         );
 
         self.phase = Phase::Funded;
         self.txid = None;
         self.raw_tx = None;
+        self.birthday = None;
+        self
+    }
+
+    /// The stored transaction has been submitted. Its birthday is not known yet.
+    pub fn anchor_submitted(mut self) -> Self {
+        assert!(
+            matches!(self.phase, Phase::AnchorBuilt | Phase::AnchorSubmitted),
+            "only a stored anchor can wait for confirmation"
+        );
+        assert!(
+            self.txid.is_some() && self.raw_tx.is_some(),
+            "ANCHOR_SUBMITTED requires the txid and raw transaction"
+        );
+        self.phase = Phase::AnchorSubmitted;
         self.birthday = None;
         self
     }
@@ -416,7 +478,7 @@ impl TryFrom<Record> for CeremonyState {
         let capsule_hash = decode_fixed_hex("capsule hash", &record.capsule_hash_blake2b256)?;
         let (txid, raw_tx, birthday) = match phase {
             Phase::Sealed | Phase::WaitingForFunds | Phase::Funded => (None, None, None),
-            Phase::AnchorBuilt => (
+            Phase::AnchorBuilt | Phase::AnchorSubmitted => (
                 Some(require_txid(record.txid)?),
                 Some(require_raw_tx(record.raw_tx)?),
                 None,
@@ -488,7 +550,13 @@ mod tests {
         assert_eq!(built.resume_action(), ResumeAction::ResolveBroadcast);
 
         let txid = "ab".repeat(32);
-        let broadcast = built.clone().anchor_broadcast(4408922);
+        let submitted = built.clone().anchor_submitted();
+        assert_eq!(submitted.resume_action(), ResumeAction::WaitForConfirmation);
+        assert_eq!(submitted.txid(), Some(txid.as_str()));
+        assert_eq!(submitted.raw_tx(), Some("00ff"));
+        assert_eq!(submitted.birthday(), None);
+
+        let broadcast = submitted.anchor_broadcast(4408922);
         assert_eq!(broadcast.resume_action(), ResumeAction::Finalize);
         assert_eq!(broadcast.birthday(), Some(4408922));
         assert_eq!(broadcast.txid(), Some(txid.as_str()));
@@ -507,6 +575,15 @@ mod tests {
         assert_eq!(expired.txid(), None);
         assert_eq!(expired.raw_tx(), None);
         assert_eq!(expired.birthday(), None);
+
+        let expired = sealed_state()
+            .anchor_built("ab".repeat(32), "00ff".to_string())
+            .anchor_submitted()
+            .expired_anchor();
+        assert_eq!(expired.phase(), Phase::Funded);
+        assert_eq!(expired.resume_action(), ResumeAction::BuildAnchor);
+        assert_eq!(expired.txid(), None);
+        assert_eq!(expired.raw_tx(), None);
     }
 
     #[test]
@@ -522,25 +599,72 @@ mod tests {
     #[test]
     fn absent_transaction_is_sent_once_from_storage() {
         assert_eq!(
-            broadcast_action(TxPresence::Absent, 99),
+            broadcast_action(AnchorLookup::Absent),
             BroadcastAction::SendStored
         );
     }
 
     #[test]
-    fn known_transaction_is_not_sent_again() {
+    fn birthday_is_the_confirmed_inclusion_height() {
+        let inclusion: i64 = 4408922;
         assert_eq!(
-            broadcast_action(
-                TxPresence::Present {
-                    height: Some(4408922)
-                },
-                5000000
-            ),
-            BroadcastAction::Recorded { birthday: 4408922 }
+            classify_anchor(Some(inclusion), Some(u64::from(ANCHOR_CONFIRMATIONS))),
+            AnchorLookup::Confirmed {
+                birthday: inclusion as u32
+            }
         );
         assert_eq!(
-            broadcast_action(TxPresence::Present { height: None }, 4408922),
-            BroadcastAction::Recorded { birthday: 4408922 }
+            broadcast_action(classify_anchor(
+                Some(inclusion),
+                Some(u64::from(ANCHOR_CONFIRMATIONS))
+            )),
+            BroadcastAction::Confirmed {
+                birthday: inclusion as u32
+            }
+        );
+    }
+
+    #[test]
+    fn unconfirmed_anchor_does_not_take_a_birthday() {
+        let pending = [
+            classify_anchor(None, None),
+            classify_anchor(None, Some(0)),
+            classify_anchor(Some(4408922), None),
+            classify_anchor(Some(4408922), Some(u64::from(ANCHOR_CONFIRMATIONS - 1))),
+            classify_anchor(None, Some(100)),
+            classify_anchor(Some(i64::from(u32::MAX) + 1), Some(100)),
+        ];
+        for lookup in pending {
+            assert!(matches!(lookup, AnchorLookup::Pending { .. }));
+            assert_eq!(broadcast_action(lookup), BroadcastAction::AwaitConfirmation);
+        }
+    }
+
+    #[test]
+    fn side_chain_anchor_is_resubmitted() {
+        assert_eq!(classify_anchor(Some(-1), Some(0)), AnchorLookup::SideChain);
+        assert_eq!(
+            classify_anchor(Some(-1), Some(100)),
+            AnchorLookup::SideChain
+        );
+        assert_eq!(
+            broadcast_action(AnchorLookup::SideChain),
+            BroadcastAction::SendStored
+        );
+    }
+
+    #[test]
+    fn a_reorg_before_confirmation_keeps_the_later_inclusion_height() {
+        assert_eq!(
+            broadcast_action(classify_anchor(Some(100), Some(3))),
+            BroadcastAction::AwaitConfirmation
+        );
+        assert_eq!(
+            broadcast_action(classify_anchor(
+                Some(108),
+                Some(u64::from(ANCHOR_CONFIRMATIONS))
+            )),
+            BroadcastAction::Confirmed { birthday: 108 }
         );
     }
 
@@ -566,7 +690,15 @@ mod tests {
         assert_eq!(loaded, built);
         assert!(loaded.funding_info().is_ok());
 
-        let broadcast = built.anchor_broadcast(4408922);
+        let submitted = built.anchor_submitted();
+        store(&state_path, &submitted);
+        let loaded = load(&state_path, &capsule_path).unwrap().unwrap();
+        assert_eq!(loaded, submitted);
+        assert_eq!(loaded.resume_action(), ResumeAction::WaitForConfirmation);
+        assert_eq!(loaded.raw_tx(), Some("1234"));
+        assert_eq!(loaded.birthday(), None);
+
+        let broadcast = submitted.anchor_broadcast(4408922);
         store(&state_path, &broadcast);
         let loaded = load(&state_path, &capsule_path).unwrap().unwrap();
         assert_eq!(loaded.phase(), Phase::AnchorBroadcast);

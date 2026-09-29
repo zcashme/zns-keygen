@@ -68,14 +68,21 @@ When the ceremony runs, `zns-keygen`:
     before broadcasting it. The plaintext seed and signing key are dropped
     before the transaction is stored.
 11. Asks Zebra whether that txid is already known. If it is not, broadcasts the
-    stored transaction. If it is, does not build or broadcast another. Either
-    way, immediately persists `ANCHOR_BROADCAST` with the txid and birthday.
-12. Writes `keys/zns_custody_manifest.toml` and `keys/zns_mint.conf`, records
+    stored transaction. Either way, persists `ANCHOR_SUBMITTED` and waits until
+    that same txid has 10 confirmations on the best chain. The birthday is the
+    height of the block that contains it. A mempool entry, a missing height, or
+    a failed Zebra query does not set a birthday and does not finish the
+    ceremony. A side-chain response (`height` of `-1`) is not a birthday
+    either. That transaction is no longer a mining candidate, so keygen
+    broadcasts the stored transaction again. Zebra can accept it back into the
+    mempool, or reject it as expired, which rebuilds one replacement.
+12. Persists `ANCHOR_BROADCAST` with that confirmed height, writes
+    `keys/zns_custody_manifest.toml` and `keys/zns_mint.conf`, records
     `COMPLETE`, and exits.
 
 The ordering is:
 
-`generate seed → seal capsule → request and verify attestation → persist attestation → wait for funding → unseal → build, sign, and persist the anchor → broadcast → persist txid and birthday → write manifest and mint config → complete`
+`generate seed → seal capsule → request and verify attestation → persist attestation → wait for funding → unseal → build, sign, and persist the anchor → broadcast → wait for 10 confirmations → persist txid and inclusion height → write manifest and mint config → complete`
 
 Restart continues from the persisted state:
 
@@ -83,7 +90,8 @@ Restart continues from the persisted state:
 - `WAITING_FOR_FUNDS` resumes the funding wait.
 - `FUNDED` constructs the anchor.
 - `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it. If Zebra reports that the stored transaction expired before it was accepted, the ceremony returns to `FUNDED` and builds a new anchor at the current tip.
-- `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction.
+- `ANCHOR_SUBMITTED` keeps waiting for the stored txid to reach 10 best-chain confirmations. It does not generate a seed or build another anchor because confirmation is still pending. If the txid disappears, or Zebra reports it only on a side chain, it rebroadcasts that same transaction. It builds a replacement only when Zebra rejects the stored transaction as expired, which returns the ceremony to `FUNDED`. A reorg before 10 confirmations resumes the wait, and the birthday is the height of the later best-chain inclusion.
+- `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction. The birthday stored here stays fixed.
 - `COMPLETE` exits successfully.
 
 The capsule is the authoritative copy of the ceremony seed the moment it is
@@ -130,8 +138,13 @@ expected_seed_fingerprint = "zip32seedfp..."
 birthday = 1234567
 ```
 
-`birthday` is the chain tip height observed after the genesis anchor
-transaction is broadcast.
+`birthday` is the best-chain block height that contains the genesis anchor
+transaction, the transaction that creates the 40 Registry anchors. It is
+written only after that transaction has 10 confirmations. A broadcast, a
+mempool entry, or the chain tip does not establish it. Before those 10
+confirmations a reorg can move the transaction, and the ceremony keeps waiting
+for the later best-chain inclusion. After `ANCHOR_BROADCAST`, the value stays
+fixed.
 
 `zns-mint` reads this on startup and refuses to run if the decrypted seed's
 fingerprint does not match `expected_seed_fingerprint`.

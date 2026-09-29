@@ -70,9 +70,12 @@ When the ceremony runs, `zns-keygen`:
 11. Asks Zebra whether that txid is already known. If it is not, broadcasts the
     stored transaction. Either way, persists `ANCHOR_SUBMITTED` and waits until
     that same txid has 10 confirmations on the best chain. The birthday is the
-    height of the block that contains it. A mempool entry, a side-chain
-    response, a missing height, or a failed Zebra query does not set a birthday
-    and does not finish the ceremony.
+    height of the block that contains it. A mempool entry, a missing height, or
+    a failed Zebra query does not set a birthday and does not finish the
+    ceremony. A side-chain response (`height` of `-1`) is not a birthday
+    either. That transaction is no longer a mining candidate, so keygen
+    broadcasts the stored transaction again. Zebra can accept it back into the
+    mempool, or reject it as expired, which rebuilds one replacement.
 12. Persists `ANCHOR_BROADCAST` with that confirmed height, writes
     `keys/zns_custody_manifest.toml` and `keys/zns_mint.conf`, records
     `COMPLETE`, and exits.
@@ -87,7 +90,7 @@ Restart continues from the persisted state:
 - `WAITING_FOR_FUNDS` resumes the funding wait.
 - `FUNDED` constructs the anchor.
 - `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it. If Zebra reports that the stored transaction expired before it was accepted, the ceremony returns to `FUNDED` and builds a new anchor at the current tip.
-- `ANCHOR_SUBMITTED` keeps waiting for the stored txid to reach 10 best-chain confirmations. It does not generate a seed or build another anchor because confirmation is still pending. If the txid disappears, it rebroadcasts that same transaction. It builds a replacement only when Zebra rejects the stored transaction as expired, which returns the ceremony to `FUNDED`. A reorg before 10 confirmations resumes the wait, and the birthday is the height of the later best-chain inclusion.
+- `ANCHOR_SUBMITTED` keeps waiting for the stored txid to reach 10 best-chain confirmations. It does not generate a seed or build another anchor because confirmation is still pending. If the txid disappears, or Zebra reports it only on a side chain, it rebroadcasts that same transaction. It builds a replacement only when Zebra rejects the stored transaction as expired, which returns the ceremony to `FUNDED`. A reorg before 10 confirmations resumes the wait, and the birthday is the height of the later best-chain inclusion.
 - `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction. The birthday stored here stays fixed.
 - `COMPLETE` exits successfully.
 

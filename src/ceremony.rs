@@ -106,15 +106,20 @@ pub enum ResumeAction {
 pub enum AnchorLookup {
     /// The node does not have this txid in the mempool or the best chain.
     Absent,
-    /// Known, but not yet a confirmed best-chain inclusion.
+    /// In the mempool, or mined on the best chain with fewer than [`ANCHOR_CONFIRMATIONS`].
     ///
-    /// `height` is missing for a mempool transaction and negative for a side
-    /// chain. `confirmations` is missing or below [`ANCHOR_CONFIRMATIONS`]
-    /// until the inclusion height can be the birthday.
+    /// `height` is missing for a mempool transaction. `confirmations` is missing
+    /// or still below the required depth.
     Pending {
         height: Option<i64>,
         confirmations: Option<u64>,
     },
+    /// Zebra still has the transaction, but only on a side chain.
+    ///
+    /// A negative height, including `-1`, is not a mining candidate. The stored
+    /// transaction has to be submitted again so the node can accept it into the
+    /// mempool or reject it as expired.
+    SideChain,
     /// Best-chain block that contains the anchor, after [`ANCHOR_CONFIRMATIONS`].
     Confirmed { birthday: u32 },
 }
@@ -132,9 +137,13 @@ pub enum BroadcastAction {
 
 /// Classify a verbose `getrawtransaction` result.
 ///
-/// A missing height, a missing confirmation count, a negative height, or fewer
-/// than [`ANCHOR_CONFIRMATIONS`] stays pending. The chain tip is not an input.
+/// A missing height, a missing confirmation count, or fewer than
+/// [`ANCHOR_CONFIRMATIONS`] stays pending. A negative height is a side chain.
+/// The chain tip is not an input.
 pub fn classify_anchor(height: Option<i64>, confirmations: Option<u64>) -> AnchorLookup {
+    if matches!(height, Some(height) if height < 0) {
+        return AnchorLookup::SideChain;
+    }
     if let (Some(height), Some(confirmations)) = (height, confirmations)
         && height >= 0
         && confirmations >= u64::from(ANCHOR_CONFIRMATIONS)
@@ -151,7 +160,7 @@ pub fn classify_anchor(height: Option<i64>, confirmations: Option<u64>) -> Ancho
 /// Decide the broadcast step from a lookup that has already been performed.
 pub fn broadcast_action(lookup: AnchorLookup) -> BroadcastAction {
     match lookup {
-        AnchorLookup::Absent => BroadcastAction::SendStored,
+        AnchorLookup::Absent | AnchorLookup::SideChain => BroadcastAction::SendStored,
         AnchorLookup::Pending { .. } => BroadcastAction::AwaitConfirmation,
         AnchorLookup::Confirmed { birthday } => BroadcastAction::Confirmed { birthday },
     }
@@ -620,7 +629,6 @@ mod tests {
         let pending = [
             classify_anchor(None, None),
             classify_anchor(None, Some(0)),
-            classify_anchor(Some(-1), Some(0)),
             classify_anchor(Some(4408922), None),
             classify_anchor(Some(4408922), Some(u64::from(ANCHOR_CONFIRMATIONS - 1))),
             classify_anchor(None, Some(100)),
@@ -630,6 +638,19 @@ mod tests {
             assert!(matches!(lookup, AnchorLookup::Pending { .. }));
             assert_eq!(broadcast_action(lookup), BroadcastAction::AwaitConfirmation);
         }
+    }
+
+    #[test]
+    fn side_chain_anchor_is_resubmitted() {
+        assert_eq!(classify_anchor(Some(-1), Some(0)), AnchorLookup::SideChain);
+        assert_eq!(
+            classify_anchor(Some(-1), Some(100)),
+            AnchorLookup::SideChain
+        );
+        assert_eq!(
+            broadcast_action(AnchorLookup::SideChain),
+            BroadcastAction::SendStored
+        );
     }
 
     #[test]

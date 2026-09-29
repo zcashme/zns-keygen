@@ -306,7 +306,13 @@ fn resolve_broadcast(state: ceremony::CeremonyState, state_path: &Path) -> cerem
         let lookup = anchor_lookup(&txid);
         match ceremony::broadcast_action(lookup) {
             ceremony::BroadcastAction::SendStored => {
-                tracing::info!(txid, "broadcasting stored anchor");
+                match lookup {
+                    ceremony::AnchorLookup::SideChain => tracing::info!(
+                        txid,
+                        "stored anchor is on a side chain; rebroadcasting the same transaction"
+                    ),
+                    _ => tracing::info!(txid, "broadcasting stored anchor"),
+                }
                 match submit_stored_anchor(&state, state_path, &txid) {
                     StoredSubmit::Accepted => return record_submitted(state, state_path, &txid),
                     StoredSubmit::Expired(state) => return state,
@@ -327,7 +333,9 @@ fn resolve_broadcast(state: ceremony::CeremonyState, state_path: &Path) -> cerem
 /// Poll until the stored anchor's best-chain inclusion can be the birthday.
 ///
 /// A restart stays on this transaction. The chain tip is not a birthday. An
-/// RPC failure, a mempool entry, or a side chain leaves the ceremony pending.
+/// RPC failure or a mempool entry leaves the ceremony pending. A side-chain
+/// result is submitted again: Zebra can put that same transaction back in the
+/// mempool, or reject it as expired so the ceremony builds a replacement.
 fn wait_for_confirmation(
     state: ceremony::CeremonyState,
     state_path: &Path,
@@ -340,10 +348,16 @@ fn wait_for_confirmation(
         let lookup = anchor_lookup(&txid);
         match ceremony::broadcast_action(lookup) {
             ceremony::BroadcastAction::SendStored => {
-                tracing::warn!(
-                    txid,
-                    "stored anchor is not in the mempool or best chain; rebroadcasting the same transaction"
-                );
+                match lookup {
+                    ceremony::AnchorLookup::SideChain => tracing::warn!(
+                        txid,
+                        "stored anchor is on a side chain; rebroadcasting the same transaction"
+                    ),
+                    _ => tracing::warn!(
+                        txid,
+                        "stored anchor is not in the mempool or best chain; rebroadcasting the same transaction"
+                    ),
+                }
                 match submit_stored_anchor(&state, state_path, &txid) {
                     StoredSubmit::Accepted => {
                         tracing::info!(

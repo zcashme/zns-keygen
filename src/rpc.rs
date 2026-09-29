@@ -69,11 +69,11 @@ impl Rpc {
             serde_json::json!([txid, 1]),
         ) {
             Ok(value) => {
-                let height = value
-                    .get("height")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|height| u32::try_from(height).unwrap_or(u32::MAX));
-                Ok(TxLookup::Present { height })
+                let (height, confirmations) = transaction_position(&value);
+                Ok(TxLookup::Found {
+                    height,
+                    confirmations,
+                })
             }
             Err(message) if transaction_is_absent(&message) => Ok(TxLookup::Absent),
             Err(message) => Err(message),
@@ -84,7 +84,23 @@ impl Rpc {
 /// Result of looking up one transaction id.
 pub enum TxLookup {
     Absent,
-    Present { height: Option<u32> },
+    /// `height` is missing in the mempool and negative on a side chain.
+    /// `confirmations` is missing until the transaction is in a block.
+    Found {
+        height: Option<i64>,
+        confirmations: Option<u64>,
+    },
+}
+
+/// Height and confirmation count from a verbose transaction object.
+///
+/// A negative height is preserved. It is not a best-chain inclusion.
+pub(crate) fn transaction_position(value: &serde_json::Value) -> (Option<i64>, Option<u64>) {
+    let height = value.get("height").and_then(serde_json::Value::as_i64);
+    let confirmations = value
+        .get("confirmations")
+        .and_then(serde_json::Value::as_u64);
+    (height, confirmations)
 }
 
 /// True only for the RPC error Zebra and zcashd use when a txid is unknown.
@@ -96,6 +112,13 @@ pub(crate) fn transaction_is_absent(error: &str) -> bool {
         || lower.contains("no such transaction")
         || lower.contains("no information available about transaction")
         || lower.contains("transaction not found in mempool or best chain")
+}
+
+/// True when Zebra rejected the stored anchor because its expiry height passed.
+pub(crate) fn transaction_is_expired(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("greater than its expiry")
 }
 
 #[derive(Deserialize)]
@@ -134,7 +157,7 @@ pub struct AddressUtxo {
 
 #[cfg(test)]
 mod tests {
-    use super::transaction_is_absent;
+    use super::{transaction_is_absent, transaction_is_expired, transaction_position};
 
     #[test]
     fn only_a_missing_transaction_counts_as_absent() {
@@ -152,5 +175,32 @@ mod tests {
         assert!(!transaction_is_absent(
             "RPC error: transaction already in block chain"
         ));
+    }
+
+    #[test]
+    fn transaction_position_keeps_side_chain_and_mempool() {
+        assert_eq!(
+            transaction_position(&serde_json::json!({"height": -1, "confirmations": 0})),
+            (Some(-1), Some(0))
+        );
+        assert_eq!(
+            transaction_position(&serde_json::json!({"hex": "00"})),
+            (None, None)
+        );
+        assert_eq!(
+            transaction_position(&serde_json::json!({"height": 4408922, "confirmations": 10})),
+            (Some(4408922), Some(10))
+        );
+    }
+
+    #[test]
+    fn only_an_expiry_rejection_rebuilds_the_anchor() {
+        assert!(transaction_is_expired(
+            "RPC error: transaction is greater than its expiry"
+        ));
+        assert!(!transaction_is_expired(
+            "RPC error: transaction already in block chain"
+        ));
+        assert!(!transaction_is_expired("RPC transport: connection refused"));
     }
 }

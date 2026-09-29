@@ -179,7 +179,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dc0086e469182132244e9b8d313a0742e1132da43a08c24b9dd3c18e0faf3a"
 dependencies = [
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -270,7 +270,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -588,7 +588,7 @@ dependencies = [
  "rand_core",
  "serde",
  "serdect",
- "thiserror",
+ "thiserror 2.0.20",
  "visibility",
  "zeroize",
  "zeroize_derive",
@@ -1402,7 +1402,7 @@ dependencies = [
  "pasta_curves",
  "rand_core",
  "serde",
- "thiserror",
+ "thiserror 2.0.20",
  "zeroize",
 ]
 
@@ -1425,7 +1425,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom",
  "libredox",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1868,11 +1868,31 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.20",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2487,7 +2507,7 @@ dependencies = [
  "secp256k1",
  "sha1",
  "sha2 0.10.9",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2637,21 +2657,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
-name = "zns-keygen"
+name = "zns-canon"
 version = "0.1.0"
+source = "git+https://github.com/zcashme/zns-canon.git?branch=main#d1a7a65580ed0f78db96ac8a42eecd4719b42e1a"
 dependencies = [
- "bech32",
  "blake2b_simd",
  "chacha20poly1305",
  "hex",
- "orchard",
  "postcard",
+ "rand",
+ "secrecy",
+ "serde",
+ "sev",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tracing",
+ "ureq",
+ "zeroize",
+ "zip32",
+]
+
+[[package]]
+name = "zns-keygen"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "hex",
+ "orchard",
  "rand",
  "sapling-crypto",
  "secp256k1",
+ "secrecy",
  "serde",
  "serde_json",
- "sev",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -2664,4 +2702,5 @@ dependencies = [
  "zcash_transparent",
  "zeroize",
  "zip32",
+ "zns-canon",
 ]

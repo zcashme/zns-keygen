@@ -20,8 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 secrecy = "0.8"
-# TEMPORARY: track the zns-canon no-tee-trait branch until it merges.
-zns-canon = { git = "https://github.com/zcashme/zns-canon.git", branch = "no-tee-trait" }
+zns-canon = { git = "https://github.com/zcashme/zns-canon.git", branch = "main" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }

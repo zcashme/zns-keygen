@@ -20,7 +20,6 @@ use zcash_protocol::value::Zatoshis;
 use zeroize::Zeroize;
 use zip32::fingerprint::SeedFingerprint;
 use zns_canon::capsule::{self, MAGIC as CAPSULE_MAGIC, SEED_LEN};
-use zns_canon::sealing::RealSnpTee;
 
 use keys::{AnchorMaterial, TreasuryFundingInfo};
 
@@ -156,7 +155,9 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
         let funding = TreasuryFundingInfo::derive(&NETWORK, seed.expose_secret());
 
         tracing::info!("=== SEALING ===");
-        let capsule = capsule::seal_seed(&RealSnpTee, &seed, &mut RdseedRng)
+        let sealing_key = zns_canon::sealing::derive_sealing_key(capsule::CAPSULE_KEY_CONTEXT)
+            .unwrap_or_else(|error| panic!("FATAL: derive sealing key: {error}"));
+        let capsule = capsule::seal_seed(&sealing_key, &seed, &mut RdseedRng)
             .unwrap_or_else(|error| panic!("FATAL: seal capsule: {error}"));
         let capsule_bytes = capsule::serialize_capsule(&capsule)
             .unwrap_or_else(|error| panic!("FATAL: serialize capsule: {error}"));
@@ -243,7 +244,9 @@ fn build_anchor(
         .unwrap_or_else(|error| panic!("FATAL: read capsule: {error}"));
     let capsule = capsule::parse_capsule(&capsule_bytes)
         .unwrap_or_else(|error| panic!("FATAL: parse capsule: {error}"));
-    let seed = capsule::unseal_seed(&RealSnpTee, &capsule)
+    let sealing_key = zns_canon::sealing::derive_sealing_key(capsule::CAPSULE_KEY_CONTEXT)
+        .unwrap_or_else(|error| panic!("FATAL: derive sealing key: {error}"));
+    let seed = capsule::unseal_seed(&sealing_key, &capsule)
         .unwrap_or_else(|error| panic!("FATAL: unseal capsule: {error}"));
     let unsealed = SeedFingerprint::from_seed(seed.expose_secret()).expect("FATAL: seed length");
     assert_eq!(

@@ -193,7 +193,7 @@ fn attest(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Ceremo
         }
         Ok(_) => {
             let bytes = fs::read(attestation_path).expect("FATAL: read attestation");
-            let _checked = zns_canon::attestation::stored(bytes, &expected);
+            zns_canon::attestation::stored(bytes, &expected).expect("FATAL: stored attestation");
             tracing::info!("attestation already persisted");
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -486,7 +486,8 @@ fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Cere
     let expected = zns_canon::attestation::report_data(&fingerprint, &capsule_hash);
     let report_bytes =
         fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
-    let attestation = zns_canon::attestation::stored(report_bytes, &expected);
+    let attestation =
+        zns_canon::attestation::stored(report_bytes, &expected).expect("FATAL: stored attestation");
     let report_data_hash = blake2b256(&expected);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);

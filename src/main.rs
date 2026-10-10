@@ -125,12 +125,12 @@ fn run_ceremony() {
 
     loop {
         state = match state.resume_action() {
-            ceremony::ResumeAction::Attest => attest(state, state_path),
+            ceremony::ResumeAction::Attest => attest(state, state_path, capsule_path),
             ceremony::ResumeAction::WaitForFunding => wait_for_funding(state, state_path),
             ceremony::ResumeAction::BuildAnchor => build_anchor(state, state_path, capsule_path),
             ceremony::ResumeAction::ResolveBroadcast => resolve_broadcast(state, state_path),
             ceremony::ResumeAction::WaitForConfirmation => wait_for_confirmation(state, state_path),
-            ceremony::ResumeAction::Finalize => finalize(state, state_path),
+            ceremony::ResumeAction::Finalize => finalize(state, state_path, capsule_path),
             ceremony::ResumeAction::Done => {
                 tracing::info!("=== CEREMONY COMPLETE ===");
                 return;
@@ -161,7 +161,7 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
             .unwrap_or_else(|error| panic!("FATAL: seal capsule: {error}"));
         let capsule_bytes = capsule::serialize_capsule(&capsule)
             .unwrap_or_else(|error| panic!("FATAL: serialize capsule: {error}"));
-        let capsule_hash = blake2b256(&capsule_bytes);
+        let capsule_hash = capsule::hash(&capsule_bytes);
         write_secret_file(capsule_path, &capsule_bytes);
         tracing::info!("capsule persisted; dropping plaintext seed");
         drop(seed);
@@ -184,21 +184,26 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
     state
 }
 
-fn attest(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::CeremonyState {
+fn attest(
+    state: ceremony::CeremonyState,
+    state_path: &Path,
+    capsule_path: &Path,
+) -> ceremony::CeremonyState {
     let attestation_path = Path::new(ATTESTATION_FILE);
-    let expected = zns_canon::attestation::report_data(state.fingerprint(), state.capsule_hash());
+    let capsule_bytes = fs::read(capsule_path).expect("FATAL: read capsule");
     match fs::symlink_metadata(attestation_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             panic!("FATAL: {} is a symlink", attestation_path.display());
         }
         Ok(_) => {
             let bytes = fs::read(attestation_path).expect("FATAL: read attestation");
-            zns_canon::attestation::stored(bytes, &expected).expect("FATAL: stored attestation");
+            zns_canon::attestation::verify(&capsule_bytes, state.fingerprint(), bytes)
+                .expect("FATAL: stored attestation");
             tracing::info!("attestation already persisted");
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("=== ATTESTATION ===");
-            let attestation = zns_canon::attestation::request(&expected);
+            let attestation = zns_canon::attestation::request(&capsule_bytes, state.fingerprint());
             write_atomic(attestation_path, &attestation.report_bytes, 0o644);
             tracing::info!("attestation persisted");
         }
@@ -475,19 +480,22 @@ fn record_confirmed(
     state
 }
 
-fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::CeremonyState {
+fn finalize(
+    state: ceremony::CeremonyState,
+    state_path: &Path,
+    capsule_path: &Path,
+) -> ceremony::CeremonyState {
     let fingerprint = *state.fingerprint();
-    let capsule_hash = *state.capsule_hash();
     let birthday = BlockHeight::from_u32(
         state
             .birthday()
             .expect("FATAL: broadcast anchor has no birthday"),
     );
-    let expected = zns_canon::attestation::report_data(&fingerprint, &capsule_hash);
+    let capsule_bytes = fs::read(capsule_path).expect("FATAL: capsule missing at finalization");
     let report_bytes =
         fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
-    let attestation =
-        zns_canon::attestation::stored(report_bytes, &expected).expect("FATAL: stored attestation");
+    let attestation = zns_canon::attestation::verify(&capsule_bytes, &fingerprint, report_bytes)
+        .expect("FATAL: stored attestation");
     persist_final_outputs(
         &state,
         &attestation,
@@ -522,8 +530,7 @@ fn persist_final_outputs(
             .birthday()
             .expect("FATAL: broadcast anchor has no birthday"),
     );
-    let expected = zns_canon::attestation::report_data(&fingerprint, &capsule_hash);
-    let report_data_hash = blake2b256(&expected);
+    let report_data_hash = blake2b256(&attestation.report_data);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
     let treasury_address = state

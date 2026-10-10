@@ -166,8 +166,14 @@ guest policy, or launch measurement cannot recreate the key.
 ## Custody Manifest
 
 The manifest is public. It records the seed fingerprint, capsule hash, account
-allocation, capsule format, sealing policy, and attestation metadata. It never
-contains the seed.
+allocation, Treasury funding address, genesis anchor txid, birthday, capsule
+format, sealing policy, and attestation metadata. It never contains the seed.
+
+`treasury_address` is the transparent address shown during the funding wait.
+`anchor_txid` is the display id of the transaction stored before broadcast.
+`birthday` is that transaction's confirmed inclusion height, the same value
+written to `keys/zns_mint.conf`. The attestation report stays in
+`keys/zns_attestation.bin`; the manifest records its hash.
 
 The current account allocation is:
 

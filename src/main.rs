@@ -491,15 +491,28 @@ fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Cere
     let report_data_hash = blake2b256(&expected);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
-    let manifest = custody_manifest(
+    let treasury_address = state
+        .funding_info()
+        .expect("FATAL: ceremony state has no funding address")
+        .address()
+        .to_zcash_address(NETWORK.network_type())
+        .encode();
+    let anchor_txid = state
+        .txid()
+        .expect("FATAL: broadcast anchor has no txid")
+        .to_string();
+    let manifest = custody_manifest(CustodyManifestInputs {
         fingerprint,
-        &capsule_hash,
-        &report_data_hash,
-        &attestation_hash,
-        &measurement,
-        attestation.guest_policy,
-        &attestation.tcb_version,
-    );
+        capsule_hash: &capsule_hash,
+        treasury_address: &treasury_address,
+        anchor_txid: &anchor_txid,
+        birthday: u32::from(birthday),
+        report_data_hash: &report_data_hash,
+        attestation_hash: &attestation_hash,
+        measurement: &measurement,
+        guest_policy: attestation.guest_policy,
+        tcb_version: &attestation.tcb_version,
+    });
     let mint_config = mint_config_toml_with_birthday(fingerprint, birthday);
     write_atomic_verified(Path::new(MANIFEST_FILE), manifest.as_bytes(), 0o644);
     write_atomic_verified(Path::new(MINT_CONFIG_FILE), mint_config.as_bytes(), 0o600);
@@ -604,6 +617,9 @@ struct CustodyManifest {
     seed_length: usize,
     treasury_account: u32,
     registry_account: u32,
+    treasury_address: String,
+    anchor_txid: String,
+    birthday: u32,
     sealing: &'static str,
     sealing_root_key: &'static str,
     sealing_guest_fields: &'static str,
@@ -619,35 +635,43 @@ struct CustodyManifest {
     signer_socket: &'static str,
 }
 
-fn custody_manifest(
+struct CustodyManifestInputs<'a> {
     fingerprint: SeedFingerprint,
-    capsule_hash: &[u8; 32],
-    report_data_hash: &[u8; 32],
-    attestation_hash: &[u8; 32],
-    measurement: &str,
+    capsule_hash: &'a [u8; 32],
+    treasury_address: &'a str,
+    anchor_txid: &'a str,
+    birthday: u32,
+    report_data_hash: &'a [u8; 32],
+    attestation_hash: &'a [u8; 32],
+    measurement: &'a str,
     guest_policy: u64,
-    tcb_version: &str,
-) -> String {
+    tcb_version: &'a str,
+}
+
+fn custody_manifest(inputs: CustodyManifestInputs<'_>) -> String {
     let m = CustodyManifest {
         manifest_version: 1,
         network: NETWORK_LABEL,
-        seed_fingerprint: fingerprint.to_string(),
+        seed_fingerprint: inputs.fingerprint.to_string(),
         capsule_file: CAPSULE_FILE,
-        capsule_hash_blake2b256: hex::encode(capsule_hash),
+        capsule_hash_blake2b256: hex::encode(inputs.capsule_hash),
         capsule_format: String::from_utf8(CAPSULE_MAGIC.to_vec()).expect("FATAL: capsule magic"),
         seed_length: SEED_LEN,
         treasury_account: TREASURY_ACCOUNT,
         registry_account: REGISTRY_ACCOUNT,
+        treasury_address: inputs.treasury_address.to_string(),
+        anchor_txid: inputs.anchor_txid.to_string(),
+        birthday: inputs.birthday,
         sealing: "amd-sev-snp-derived-key",
         sealing_root_key: "vcek",
         sealing_guest_fields: "guest_policy,measurement",
-        guest_policy: format!("0x{guest_policy:016x}"),
-        tcb_version: tcb_version.to_string(),
+        guest_policy: format!("0x{:016x}", inputs.guest_policy),
+        tcb_version: inputs.tcb_version.to_string(),
         rng: "rdseed",
         attestation_file: ATTESTATION_FILE,
-        attestation_hash_blake2b256: hex::encode(attestation_hash),
-        report_data_hash_blake2b256: hex::encode(report_data_hash),
-        measurement: measurement.to_string(),
+        attestation_hash_blake2b256: hex::encode(inputs.attestation_hash),
+        report_data_hash_blake2b256: hex::encode(inputs.report_data_hash),
+        measurement: inputs.measurement.to_string(),
         attestation_sig_algo: "ecdsa-p384-sha384",
         migration: "none",
         signer_socket: "none",
@@ -912,16 +936,23 @@ mod tests {
             0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
-        let manifest = custody_manifest(
-            fp,
-            &[0u8; 32],
-            &[0u8; 32],
-            &[0u8; 32],
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            0x30000,
-            "bootloader=0 tee=0 snp=0 microcode=0",
-        );
+        let txid = "ab".repeat(32);
+        let manifest = custody_manifest(CustodyManifestInputs {
+            fingerprint: fp,
+            capsule_hash: &[0u8; 32],
+            treasury_address: "tmTestTreasuryAddress",
+            anchor_txid: &txid,
+            birthday: 4408922,
+            report_data_hash: &[0u8; 32],
+            attestation_hash: &[0u8; 32],
+            measurement: "0000000000000000000000000000000000000000000000000000000000000000",
+            guest_policy: 0x30000,
+            tcb_version: "bootloader=0 tee=0 snp=0 microcode=0",
+        });
         assert!(manifest.contains("seed_fingerprint"));
+        assert!(manifest.contains("treasury_address = \"tmTestTreasuryAddress\""));
+        assert!(manifest.contains(&format!("anchor_txid = \"{txid}\"")));
+        assert!(manifest.contains("birthday = 4408922"));
     }
 
     #[test]

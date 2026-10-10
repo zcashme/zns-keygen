@@ -488,6 +488,41 @@ fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Cere
         fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
     let attestation =
         zns_canon::attestation::stored(report_bytes, &expected).expect("FATAL: stored attestation");
+    persist_final_outputs(
+        &state,
+        &attestation,
+        Path::new(MANIFEST_FILE),
+        Path::new(MINT_CONFIG_FILE),
+    );
+
+    let state = state.complete();
+    ceremony::store(state_path, &state);
+    tracing::info!(
+        birthday = u32::from(birthday),
+        "manifest and mint config written"
+    );
+    state
+}
+
+/// Write the custody manifest and mint config from the broadcast state.
+///
+/// The Treasury address, anchor txid, and birthday come from `state`. An
+/// existing file is kept only when the new bytes match, so a resumed
+/// finalization is idempotent.
+fn persist_final_outputs(
+    state: &ceremony::CeremonyState,
+    attestation: &zns_canon::attestation::Attestation,
+    manifest_path: &Path,
+    mint_config_path: &Path,
+) {
+    let fingerprint = *state.fingerprint();
+    let capsule_hash = *state.capsule_hash();
+    let birthday = BlockHeight::from_u32(
+        state
+            .birthday()
+            .expect("FATAL: broadcast anchor has no birthday"),
+    );
+    let expected = zns_canon::attestation::report_data(&fingerprint, &capsule_hash);
     let report_data_hash = blake2b256(&expected);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
@@ -514,16 +549,8 @@ fn finalize(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::Cere
         tcb_version: &attestation.tcb_version,
     });
     let mint_config = mint_config_toml_with_birthday(fingerprint, birthday);
-    write_atomic_verified(Path::new(MANIFEST_FILE), manifest.as_bytes(), 0o644);
-    write_atomic_verified(Path::new(MINT_CONFIG_FILE), mint_config.as_bytes(), 0o600);
-
-    let state = state.complete();
-    ceremony::store(state_path, &state);
-    tracing::info!(
-        birthday = u32::from(birthday),
-        "manifest and mint config written"
-    );
-    state
+    write_atomic_verified(manifest_path, manifest.as_bytes(), 0o644);
+    write_atomic_verified(mint_config_path, mint_config.as_bytes(), 0o600);
 }
 
 /// Poll Zebra until the Treasury address is funded.
@@ -953,6 +980,83 @@ mod tests {
         assert!(manifest.contains("treasury_address = \"tmTestTreasuryAddress\""));
         assert!(manifest.contains(&format!("anchor_txid = \"{txid}\"")));
         assert!(manifest.contains("birthday = 4408922"));
+    }
+
+    #[test]
+    fn finalizing_twice_copies_the_broadcast_state_into_the_manifest() {
+        let seed = [0x11u8; SEED_LEN];
+        let funding = TreasuryFundingInfo::derive(&NETWORK, &seed);
+        let fingerprint = SeedFingerprint::from_seed(&seed).unwrap();
+        let address = funding
+            .address()
+            .to_zcash_address(NETWORK.network_type())
+            .encode();
+        let pubkey = hex::encode(funding.pubkey().serialize());
+        let state = ceremony::CeremonyState::sealed(fingerprint, [0x44; 32], address, pubkey)
+            .anchor_built("ab".repeat(32), "00ff".to_string())
+            .anchor_broadcast(4_408_922);
+        let attestation = zns_canon::attestation::Attestation {
+            report_bytes: b"snp-report".to_vec(),
+            measurement: [0x7a; 48],
+            guest_policy: 0x30000,
+            tcb_version: "bootloader=1 tee=2 snp=3 microcode=4".to_string(),
+            report_data: [0u8; zns_canon::attestation::REPORT_DATA_LEN],
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("zns-keygen-final-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let manifest_path = dir.join("zns_custody_manifest.toml");
+        let mint_path = dir.join("zns_mint.conf");
+
+        persist_final_outputs(&state, &attestation, &manifest_path, &mint_path);
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        let mint_bytes = fs::read(&mint_path).unwrap();
+        persist_final_outputs(&state, &attestation, &manifest_path, &mint_path);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+        assert_eq!(fs::read(&mint_path).unwrap(), mint_bytes);
+
+        let manifest: toml::Value =
+            toml::from_str(std::str::from_utf8(&manifest_bytes).unwrap()).unwrap();
+        let mint: toml::Value = toml::from_str(std::str::from_utf8(&mint_bytes).unwrap()).unwrap();
+        let expected_address = state
+            .funding_info()
+            .unwrap()
+            .address()
+            .to_zcash_address(NETWORK.network_type())
+            .encode();
+        assert_eq!(
+            manifest["treasury_address"].as_str().unwrap(),
+            expected_address
+        );
+        assert_eq!(
+            manifest["anchor_txid"].as_str().unwrap(),
+            state.txid().unwrap()
+        );
+        assert_eq!(
+            u32::try_from(manifest["birthday"].as_integer().unwrap()).unwrap(),
+            state.birthday().unwrap()
+        );
+        assert_eq!(
+            manifest["seed_fingerprint"].as_str().unwrap(),
+            state.fingerprint().to_string()
+        );
+        assert_eq!(
+            manifest["capsule_hash_blake2b256"].as_str().unwrap(),
+            hex::encode(state.capsule_hash())
+        );
+        assert_eq!(
+            mint["expected_seed_fingerprint"].as_str().unwrap(),
+            state.fingerprint().to_string()
+        );
+        assert_eq!(
+            u32::try_from(mint["birthday"].as_integer().unwrap()).unwrap(),
+            state.birthday().unwrap()
+        );
+        assert_eq!(mint["birthday"], manifest["birthday"]);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

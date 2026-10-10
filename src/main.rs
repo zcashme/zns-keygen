@@ -191,6 +191,11 @@ fn attest(
 ) -> ceremony::CeremonyState {
     let attestation_path = Path::new(ATTESTATION_FILE);
     let capsule_bytes = fs::read(capsule_path).expect("FATAL: read capsule");
+    assert_eq!(
+        capsule::hash(&capsule_bytes),
+        *state.capsule_hash(),
+        "FATAL: capsule file does not match ceremony state"
+    );
     match fs::symlink_metadata(attestation_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             panic!("FATAL: {} is a symlink", attestation_path.display());
@@ -492,6 +497,11 @@ fn finalize(
             .expect("FATAL: broadcast anchor has no birthday"),
     );
     let capsule_bytes = fs::read(capsule_path).expect("FATAL: capsule missing at finalization");
+    assert_eq!(
+        capsule::hash(&capsule_bytes),
+        *state.capsule_hash(),
+        "FATAL: capsule file does not match ceremony state"
+    );
     let report_bytes =
         fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
     let attestation = zns_canon::attestation::verify(&capsule_bytes, &fingerprint, report_bytes)

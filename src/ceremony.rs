@@ -40,12 +40,19 @@ pub const ANCHOR_CONFIRMATIONS: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// Capsule sealed. Next: attest.
     Sealed,
+    /// Attested. Next: wait for Treasury funding.
     WaitingForFunds,
+    /// Funded. Next: build the anchor.
     Funded,
+    /// Anchor built. Next: resolve broadcast state.
     AnchorBuilt,
+    /// Anchor submitted. Next: wait for confirmation.
     AnchorSubmitted,
+    /// Anchor confirmed. Next: write manifest and mint config.
     AnchorBroadcast,
+    /// Ceremony finished.
     Complete,
 }
 
@@ -80,25 +87,6 @@ impl std::fmt::Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-/// What a resumed process is allowed to do from the persisted phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResumeAction {
-    /// Capsule is durable. Request and verify attestation if it is not stored yet.
-    Attest,
-    /// Attestation is durable. Poll for Treasury funding.
-    WaitForFunding,
-    /// Funding was observed. Unseal and construct the anchor. Do not broadcast.
-    BuildAnchor,
-    /// The signed anchor is stored. Learn whether it was broadcast before sending.
-    ResolveBroadcast,
-    /// The stored anchor was submitted. Wait until its best-chain inclusion is confirmed.
-    WaitForConfirmation,
-    /// Txid and birthday are durable. Write the manifest and mint config only.
-    Finalize,
-    /// Ceremony finished. Exit successfully.
-    Done,
 }
 
 /// What a lookup of the stored anchor txid means for the birthday.
@@ -219,18 +207,6 @@ impl CeremonyState {
 
     pub fn birthday(&self) -> Option<u32> {
         self.birthday
-    }
-
-    pub fn resume_action(&self) -> ResumeAction {
-        match self.phase {
-            Phase::Sealed => ResumeAction::Attest,
-            Phase::WaitingForFunds => ResumeAction::WaitForFunding,
-            Phase::Funded => ResumeAction::BuildAnchor,
-            Phase::AnchorBuilt => ResumeAction::ResolveBroadcast,
-            Phase::AnchorSubmitted => ResumeAction::WaitForConfirmation,
-            Phase::AnchorBroadcast => ResumeAction::Finalize,
-            Phase::Complete => ResumeAction::Done,
-        }
     }
 
     pub fn waiting_for_funds(mut self) -> Self {
@@ -534,35 +510,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_actions_follow_the_ceremony_order() {
-        let sealed = sealed_state();
-        assert_eq!(sealed.resume_action(), ResumeAction::Attest);
-
-        let waiting = sealed.clone().waiting_for_funds();
-        assert_eq!(waiting.resume_action(), ResumeAction::WaitForFunding);
-
-        let funded = waiting.clone().funded();
-        assert_eq!(funded.resume_action(), ResumeAction::BuildAnchor);
-
-        let built = funded
-            .clone()
-            .anchor_built("ab".repeat(32), "00ff".to_string());
-        assert_eq!(built.resume_action(), ResumeAction::ResolveBroadcast);
-
+    fn state_transitions_carry_the_ceremony_data() {
         let txid = "ab".repeat(32);
-        let submitted = built.clone().anchor_submitted();
-        assert_eq!(submitted.resume_action(), ResumeAction::WaitForConfirmation);
+        let submitted = sealed_state()
+            .waiting_for_funds()
+            .funded()
+            .anchor_built(txid.clone(), "00ff".to_string())
+            .anchor_submitted();
         assert_eq!(submitted.txid(), Some(txid.as_str()));
         assert_eq!(submitted.raw_tx(), Some("00ff"));
         assert_eq!(submitted.birthday(), None);
 
         let broadcast = submitted.anchor_broadcast(4408922);
-        assert_eq!(broadcast.resume_action(), ResumeAction::Finalize);
+        assert_eq!(broadcast.phase(), Phase::AnchorBroadcast);
         assert_eq!(broadcast.birthday(), Some(4408922));
-        assert_eq!(broadcast.txid(), Some(txid.as_str()));
 
-        let complete = broadcast.complete();
-        assert_eq!(complete.resume_action(), ResumeAction::Done);
+        assert_eq!(broadcast.complete().phase(), Phase::Complete);
     }
 
     #[test]
@@ -571,7 +534,6 @@ mod tests {
             .anchor_built("ab".repeat(32), "00ff".to_string())
             .expired_anchor();
         assert_eq!(expired.phase(), Phase::Funded);
-        assert_eq!(expired.resume_action(), ResumeAction::BuildAnchor);
         assert_eq!(expired.txid(), None);
         assert_eq!(expired.raw_tx(), None);
         assert_eq!(expired.birthday(), None);
@@ -581,19 +543,8 @@ mod tests {
             .anchor_submitted()
             .expired_anchor();
         assert_eq!(expired.phase(), Phase::Funded);
-        assert_eq!(expired.resume_action(), ResumeAction::BuildAnchor);
         assert_eq!(expired.txid(), None);
         assert_eq!(expired.raw_tx(), None);
-    }
-
-    #[test]
-    fn anchor_broadcast_never_resolves_or_rebuilds() {
-        let state = sealed_state()
-            .anchor_built("cd".repeat(32), "ab".to_string())
-            .anchor_broadcast(10);
-        assert_eq!(state.resume_action(), ResumeAction::Finalize);
-        assert_ne!(state.resume_action(), ResumeAction::ResolveBroadcast);
-        assert_ne!(state.resume_action(), ResumeAction::BuildAnchor);
     }
 
     #[test]
@@ -694,7 +645,7 @@ mod tests {
         store(&state_path, &submitted);
         let loaded = load(&state_path, &capsule_path).unwrap().unwrap();
         assert_eq!(loaded, submitted);
-        assert_eq!(loaded.resume_action(), ResumeAction::WaitForConfirmation);
+        assert_eq!(loaded.phase(), Phase::AnchorSubmitted);
         assert_eq!(loaded.raw_tx(), Some("1234"));
         assert_eq!(loaded.birthday(), None);
 
@@ -704,7 +655,6 @@ mod tests {
         assert_eq!(loaded.phase(), Phase::AnchorBroadcast);
         assert_eq!(loaded.birthday(), Some(4408922));
         assert!(loaded.raw_tx().is_none());
-        assert_eq!(loaded.resume_action(), ResumeAction::Finalize);
 
         fs::remove_file(&capsule_path).unwrap();
         let error = load(&state_path, &capsule_path).unwrap_err();

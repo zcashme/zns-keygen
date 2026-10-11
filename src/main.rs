@@ -71,14 +71,14 @@ fn main() {
     };
 
     loop {
-        state = match state.resume_action() {
-            ceremony::ResumeAction::Attest => attest(state, state_path, capsule_path),
-            ceremony::ResumeAction::WaitForFunding => wait_for_funding(state, state_path),
-            ceremony::ResumeAction::BuildAnchor => build_anchor(state, state_path, capsule_path),
-            ceremony::ResumeAction::ResolveBroadcast => resolve_broadcast(state, state_path),
-            ceremony::ResumeAction::WaitForConfirmation => wait_for_confirmation(state, state_path),
-            ceremony::ResumeAction::Finalize => finalize(state, state_path, capsule_path),
-            ceremony::ResumeAction::Done => {
+        state = match state.phase() {
+            ceremony::Phase::Sealed => attest(state, state_path, capsule_path),
+            ceremony::Phase::WaitingForFunds => wait_for_funding(state, state_path),
+            ceremony::Phase::Funded => build_anchor(state, state_path, capsule_path),
+            ceremony::Phase::AnchorBuilt => resolve_broadcast(state, state_path),
+            ceremony::Phase::AnchorSubmitted => wait_for_confirmation(state, state_path),
+            ceremony::Phase::AnchorBroadcast => finalize(state, state_path, capsule_path),
+            ceremony::Phase::Complete => {
                 tracing::info!("=== CEREMONY COMPLETE ===");
                 return;
             }

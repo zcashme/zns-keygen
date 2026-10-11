@@ -26,12 +26,10 @@ logic. The mint only ever consumes a capsule that `zns-keygen` produced.
 
 ```text
 zns-keygen
-zns-keygen --help
 ```
 
-With no arguments, `zns-keygen` runs the ceremony below. `-h` and `--help` print usage and exit. They do not generate a seed, write files, or wait for funding. Any other argument prints the same usage and exits with status 2.
-
-The network is chosen at compile time (`--features testnet` selects testnet). The help text names the network this binary was built for.
+`zns-keygen` runs the ceremony below. The network is chosen at compile time
+(`--features testnet` selects testnet).
 
 When the ceremony runs, `zns-keygen`:
 

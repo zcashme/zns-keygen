@@ -53,42 +53,53 @@ fn main() {
     tracing::info!("=== ZNS KEY GENESIS ===");
     tracing::info!(network = NETWORK_LABEL, "starting ceremony");
 
+    if Path::new(MANIFEST_FILE).exists() {
+        tracing::info!("custody manifest exists; ceremony already complete");
+        return;
+    }
+
+    wipe_incomplete();
     fs::create_dir_all(KEYS_DIR).expect("FATAL: cannot create keys directory");
 
-    let state_path = Path::new(ceremony::STATE_FILE);
-    let capsule_path = Path::new(CAPSULE_FILE);
-    let mut state = match ceremony::load(state_path, capsule_path) {
-        Ok(Some(state)) => {
-            tracing::info!(phase = %state.phase(), "resuming ceremony");
-            state
-        }
-        Ok(None) => begin_ceremony(state_path, capsule_path),
-        Err(error) => panic!("FATAL: {error}"),
-    };
+    let sealed = seal_seed();
+    let attestation = attest(sealed.fingerprint);
+    let inputs = wait_for_funding(&sealed.funding);
+    let (txid, raw_tx) = build_anchor(&sealed, &inputs);
+    let birthday = broadcast_and_confirm(&txid, &raw_tx);
+    finalize(&sealed, &attestation, &txid, birthday);
+    tracing::info!("=== CEREMONY COMPLETE ===");
+}
 
-    loop {
-        state = match state.phase() {
-            ceremony::Phase::Sealed => attest(state, state_path, capsule_path),
-            ceremony::Phase::WaitingForFunds => wait_for_funding(state, state_path),
-            ceremony::Phase::Funded => build_anchor(state, state_path, capsule_path),
-            ceremony::Phase::AnchorBuilt => resolve_broadcast(state, state_path),
-            ceremony::Phase::AnchorSubmitted => wait_for_confirmation(state, state_path),
-            ceremony::Phase::AnchorBroadcast => finalize(state, state_path, capsule_path),
-            ceremony::Phase::Complete => {
-                tracing::info!("=== CEREMONY COMPLETE ===");
-                return;
-            }
-        };
+/// Facts from the sealing step that the rest of the ceremony consumes.
+struct SealedCeremony {
+    fingerprint: SeedFingerprint,
+    capsule_hash: [u8; 32],
+    funding: TreasuryFundingInfo,
+}
+
+/// Delete the artifacts of an incomplete ceremony.
+///
+/// The custody manifest is the completion record: this runs only when it is
+/// absent, so everything removed here belongs to a ceremony that never
+/// finished and whose capsule is worthless. A missing file is fine. Removing
+/// a symlink removes the link, not its target.
+fn wipe_incomplete() {
+    for path in [
+        CAPSULE_FILE,
+        ATTESTATION_FILE,
+        MINT_CONFIG_FILE,
+        "keys/ceremony_state.toml",
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => tracing::warn!(path, "removed incomplete ceremony artifact"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("FATAL: remove {path}: {error}"),
+        }
     }
 }
 
-fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyState {
-    ensure_absent(capsule_path);
-    ensure_absent(Path::new(MANIFEST_FILE));
-    ensure_absent(Path::new(MINT_CONFIG_FILE));
-    ensure_absent(Path::new(ATTESTATION_FILE));
-    ensure_absent(state_path);
-
+/// Generate the seed, seal the capsule, and derive the Treasury funding info.
+fn seal_seed() -> SealedCeremony {
     let (fingerprint, capsule_hash, funding) = {
         let seed = generate_seed();
         let fingerprint =
@@ -105,68 +116,39 @@ fn begin_ceremony(state_path: &Path, capsule_path: &Path) -> ceremony::CeremonyS
         let capsule_bytes = capsule::serialize_capsule(&capsule)
             .unwrap_or_else(|error| panic!("FATAL: serialize capsule: {error}"));
         let capsule_hash = capsule::hash(&capsule_bytes);
-        write_secret_file(capsule_path, &capsule_bytes);
+        write_secret_file(Path::new(CAPSULE_FILE), &capsule_bytes);
         tracing::info!("capsule persisted; dropping plaintext seed");
         drop(seed);
         (fingerprint, capsule_hash, funding)
     };
-
-    let treasury_address = funding
-        .address()
-        .to_zcash_address(NETWORK.network_type())
-        .encode();
-    let treasury_pubkey = hex::encode(funding.pubkey().serialize());
-    let state = ceremony::CeremonyState::sealed(
+    SealedCeremony {
         fingerprint,
         capsule_hash,
-        treasury_address,
-        treasury_pubkey,
-    );
-    ceremony::store(state_path, &state);
-    tracing::info!(phase = %state.phase(), "ceremony state persisted");
-    state
-}
-
-fn attest(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
-    capsule_path: &Path,
-) -> ceremony::CeremonyState {
-    let attestation_path = Path::new(ATTESTATION_FILE);
-    let capsule_bytes = fs::read(capsule_path).expect("FATAL: read capsule");
-    assert_eq!(
-        capsule::hash(&capsule_bytes),
-        *state.capsule_hash(),
-        "FATAL: capsule file does not match ceremony state"
-    );
-    match fs::symlink_metadata(attestation_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            panic!("FATAL: {} is a symlink", attestation_path.display());
-        }
-        Ok(_) => {
-            let bytes = fs::read(attestation_path).expect("FATAL: read attestation");
-            zns_canon::attestation::verify(&capsule_bytes, state.fingerprint(), bytes)
-                .expect("FATAL: stored attestation");
-            tracing::info!("attestation already persisted");
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!("=== ATTESTATION ===");
-            let attestation = zns_canon::attestation::request(&capsule_bytes, state.fingerprint());
-            write_atomic(attestation_path, &attestation.report_bytes, 0o644);
-            tracing::info!("attestation persisted");
-        }
-        Err(error) => panic!("FATAL: inspect {}: {error}", attestation_path.display()),
+        funding,
     }
-    let state = state.waiting_for_funds();
-    ceremony::store(state_path, &state);
-    tracing::info!(phase = %state.phase(), "ceremony state persisted");
-    state
 }
 
-fn wait_for_funding(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::CeremonyState {
-    let funding = state
-        .funding_info()
-        .expect("FATAL: ceremony state has no funding address");
+/// Request the SNP attestation for the capsule and verify it.
+fn attest(fingerprint: SeedFingerprint) -> zns_canon::attestation::Attestation {
+    tracing::info!("=== ATTESTATION ===");
+    let capsule_bytes = fs::read(CAPSULE_FILE).expect("FATAL: read capsule");
+    let attestation = zns_canon::attestation::request(&capsule_bytes, &fingerprint);
+    write_atomic(
+        Path::new(ATTESTATION_FILE),
+        &attestation.report_bytes,
+        0o644,
+    );
+    let report_bytes = fs::read(ATTESTATION_FILE).expect("FATAL: read attestation");
+    let verified = zns_canon::attestation::verify(&capsule_bytes, &fingerprint, report_bytes)
+        .expect("FATAL: stored attestation");
+    tracing::info!("attestation persisted and verified");
+    verified
+}
+
+/// Poll Zebra until the Treasury address is funded and build the spend inputs.
+fn wait_for_funding(
+    funding: &TreasuryFundingInfo,
+) -> Vec<transparent::builder::TransparentInputInfo> {
     let taddr_encoded = funding
         .address()
         .to_zcash_address(NETWORK.network_type())
@@ -175,25 +157,15 @@ fn wait_for_funding(state: ceremony::CeremonyState, state_path: &Path) -> ceremo
     tracing::info!("Treasury t-address: {taddr_encoded}");
     tracing::info!("send {NETWORK_LABEL} ZEC to: {taddr_encoded}");
     tracing::info!("minimum 500,000 zat (0.005 ZEC) for 40 anchors + Treasury change");
-    let _inputs = poll_until_funded(&funding);
-    let state = state.funded();
-    ceremony::store(state_path, &state);
-    tracing::info!(phase = %state.phase(), "ceremony state persisted");
-    state
+    poll_until_funded(funding)
 }
 
+/// Unseal the capsule and build the signed anchor transaction.
 fn build_anchor(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
-    capsule_path: &Path,
-) -> ceremony::CeremonyState {
-    let funding = state
-        .funding_info()
-        .expect("FATAL: ceremony state has no funding address");
-    let inputs = poll_until_funded(&funding);
-    let fingerprint = *state.fingerprint();
-
-    let capsule_bytes = capsule::read_capsule_file(capsule_path)
+    sealed: &SealedCeremony,
+    inputs: &[transparent::builder::TransparentInputInfo],
+) -> (String, String) {
+    let capsule_bytes = capsule::read_capsule_file(CAPSULE_FILE)
         .unwrap_or_else(|error| panic!("FATAL: read capsule: {error}"));
     let capsule = capsule::parse_capsule(&capsule_bytes)
         .unwrap_or_else(|error| panic!("FATAL: parse capsule: {error}"));
@@ -203,8 +175,13 @@ fn build_anchor(
         .unwrap_or_else(|error| panic!("FATAL: unseal capsule: {error}"));
     let unsealed = SeedFingerprint::from_seed(seed.expose_secret()).expect("FATAL: seed length");
     assert_eq!(
-        unsealed, fingerprint,
+        unsealed, sealed.fingerprint,
         "FATAL: unsealed seed fingerprint does not match the ceremony fingerprint"
+    );
+    assert_eq!(
+        capsule::hash(&capsule_bytes),
+        sealed.capsule_hash,
+        "FATAL: capsule file does not match the sealed ceremony"
     );
 
     tracing::info!("=== ANCHOR CREATION ===");
@@ -220,7 +197,7 @@ fn build_anchor(
         &material.treasury_orchard_fvk,
         &material.registry_orchard_fvk,
         tip_height,
-        &inputs,
+        inputs,
     );
     drop(material);
 
@@ -229,85 +206,22 @@ fn build_anchor(
     let raw_tx = hex::encode(&tx_bytes);
     let txid = tx.txid().to_string();
     tracing::info!(txid, "anchor tx built");
-
-    let state = state.anchor_built(txid, raw_tx);
-    ceremony::store(state_path, &state);
-    tracing::info!(phase = %state.phase(), "ceremony state persisted before broadcast");
-    state
+    (txid, raw_tx)
 }
 
-fn resolve_broadcast(state: ceremony::CeremonyState, state_path: &Path) -> ceremony::CeremonyState {
-    let txid = state
-        .txid()
-        .expect("FATAL: built anchor has no txid")
-        .to_string();
-    loop {
-        let lookup = anchor_lookup(&txid);
-        match ceremony::broadcast_action(lookup) {
-            ceremony::BroadcastAction::SendStored => {
-                match lookup {
-                    ceremony::AnchorLookup::SideChain => tracing::info!(
-                        txid,
-                        "stored anchor is on a side chain; rebroadcasting the same transaction"
-                    ),
-                    _ => tracing::info!(txid, "broadcasting stored anchor"),
-                }
-                match submit_stored_anchor(&state, state_path, &txid) {
-                    StoredSubmit::Accepted => return record_submitted(state, state_path, &txid),
-                    StoredSubmit::Expired(state) => return state,
-                    StoredSubmit::Rejected => std::thread::sleep(POLL_INTERVAL),
-                }
-            }
-            ceremony::BroadcastAction::AwaitConfirmation => {
-                tracing::info!(txid, "stored anchor is known; waiting for confirmation");
-                return record_submitted(state, state_path, &txid);
-            }
-            ceremony::BroadcastAction::Confirmed { birthday } => {
-                return record_confirmed(state, state_path, &txid, birthday);
-            }
-        }
-    }
-}
-
-/// Poll until the stored anchor's best-chain inclusion can be the birthday.
+/// Submit the anchor and wait for the birthday.
 ///
-/// A restart stays on this transaction. The chain tip is not a birthday. An
-/// RPC failure or a mempool entry leaves the ceremony pending. A side-chain
-/// result is submitted again: Zebra can put that same transaction back in the
-/// mempool, or reject it as expired so the ceremony builds a replacement.
-fn wait_for_confirmation(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
-) -> ceremony::CeremonyState {
-    let txid = state
-        .txid()
-        .expect("FATAL: submitted anchor has no txid")
-        .to_string();
+/// Rebroadcasts the same transaction if the node loses it. An expiry
+/// rejection fails the run: the next start wipes and builds a fresh ceremony.
+fn broadcast_and_confirm(txid: &str, raw_tx: &str) -> u32 {
+    tracing::info!(txid, "=== BROADCAST ===");
+    send_anchor(txid, raw_tx);
     loop {
-        let lookup = anchor_lookup(&txid);
+        let lookup = anchor_lookup(txid);
         match ceremony::broadcast_action(lookup) {
             ceremony::BroadcastAction::SendStored => {
-                match lookup {
-                    ceremony::AnchorLookup::SideChain => tracing::warn!(
-                        txid,
-                        "stored anchor is on a side chain; rebroadcasting the same transaction"
-                    ),
-                    _ => tracing::warn!(
-                        txid,
-                        "stored anchor is not in the mempool or best chain; rebroadcasting the same transaction"
-                    ),
-                }
-                match submit_stored_anchor(&state, state_path, &txid) {
-                    StoredSubmit::Accepted => {
-                        tracing::info!(
-                            txid,
-                            "same anchor rebroadcast; still waiting for inclusion"
-                        );
-                    }
-                    StoredSubmit::Expired(state) => return state,
-                    StoredSubmit::Rejected => {}
-                }
-                std::thread::sleep(POLL_INTERVAL);
+                tracing::warn!(txid, "anchor absent; rebroadcasting the same transaction");
+                send_anchor(txid, raw_tx);
             }
             ceremony::BroadcastAction::AwaitConfirmation => {
                 let ceremony::AnchorLookup::Pending {
@@ -324,12 +238,30 @@ fn wait_for_confirmation(
                     required = ceremony::ANCHOR_CONFIRMATIONS,
                     "anchor not yet confirmed"
                 );
-                std::thread::sleep(POLL_INTERVAL);
             }
             ceremony::BroadcastAction::Confirmed { birthday } => {
-                return record_confirmed(state, state_path, &txid, birthday);
+                tracing::info!(
+                    txid,
+                    birthday,
+                    "anchor confirmed; birthday is its best-chain inclusion height"
+                );
+                return birthday;
             }
         }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn send_anchor(txid: &str, raw_tx: &str) {
+    match rpc::Rpc::send_raw(raw_tx) {
+        Ok(sent) if sent == txid => tracing::info!(txid, "anchor accepted"),
+        Ok(sent) => panic!("FATAL: broadcast txid {sent} does not match built {txid}"),
+        Err(error) if rpc::transaction_is_expired(&error) => {
+            panic!(
+                "FATAL: anchor expired before it was mined; the next run builds a fresh ceremony"
+            )
+        }
+        Err(error) => tracing::warn!(%error, txid, "broadcast failed; retrying"),
     }
 }
 
@@ -349,168 +281,39 @@ fn anchor_lookup(txid: &str) -> ceremony::AnchorLookup {
     }
 }
 
-enum StoredSubmit {
-    Accepted,
-    Expired(ceremony::CeremonyState),
-    /// Zebra answered, but did not accept the transaction. Look it up again.
-    Rejected,
-}
-
-/// Submit the stored raw transaction and no other.
-///
-/// An expiry rejection is the only reason to discard it. Any other RPC failure
-/// stays on this transaction.
-fn submit_stored_anchor(
-    state: &ceremony::CeremonyState,
-    state_path: &Path,
-    txid: &str,
-) -> StoredSubmit {
-    let raw_tx = state
-        .raw_tx()
-        .expect("FATAL: stored anchor has no raw transaction")
-        .to_string();
-    match rpc::Rpc::send_raw(&raw_tx) {
-        Ok(sent) => {
-            if sent != txid {
-                panic!("FATAL: broadcast txid {sent} does not match stored {txid}");
-            }
-            StoredSubmit::Accepted
-        }
-        Err(error) if rpc::transaction_is_expired(&error) => {
-            tracing::warn!(
-                txid,
-                "stored anchor expired before it was mined; rebuilding"
-            );
-            let state = state.clone().expired_anchor();
-            ceremony::store(state_path, &state);
-            tracing::info!(
-                phase = %state.phase(),
-                "expired anchor discarded; rebuilding from funded state"
-            );
-            StoredSubmit::Expired(state)
-        }
-        Err(error) => {
-            tracing::warn!(%error, txid, "broadcast of stored anchor failed; retrying");
-            StoredSubmit::Rejected
-        }
-    }
-}
-
-fn record_submitted(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
-    txid: &str,
-) -> ceremony::CeremonyState {
-    let state = state.anchor_submitted();
-    ceremony::store(state_path, &state);
-    tracing::info!(
-        phase = %state.phase(),
-        txid,
-        "anchor submitted; birthday waits for best-chain confirmation"
-    );
-    state
-}
-
-fn record_confirmed(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
+/// Write the mint config, then the custody manifest last: the manifest's
+/// existence is the completion record.
+fn finalize(
+    sealed: &SealedCeremony,
+    attestation: &zns_canon::attestation::Attestation,
     txid: &str,
     birthday: u32,
-) -> ceremony::CeremonyState {
-    let state = state.anchor_broadcast(birthday);
-    ceremony::store(state_path, &state);
-    tracing::info!(
-        phase = %state.phase(),
-        txid,
-        birthday,
-        "anchor confirmed; birthday is its best-chain inclusion height"
-    );
-    state
-}
-
-fn finalize(
-    state: ceremony::CeremonyState,
-    state_path: &Path,
-    capsule_path: &Path,
-) -> ceremony::CeremonyState {
-    let fingerprint = *state.fingerprint();
-    let birthday = BlockHeight::from_u32(
-        state
-            .birthday()
-            .expect("FATAL: broadcast anchor has no birthday"),
-    );
-    let capsule_bytes = fs::read(capsule_path).expect("FATAL: capsule missing at finalization");
-    assert_eq!(
-        capsule::hash(&capsule_bytes),
-        *state.capsule_hash(),
-        "FATAL: capsule file does not match ceremony state"
-    );
-    let report_bytes =
-        fs::read(ATTESTATION_FILE).expect("FATAL: attestation missing at finalization");
-    let attestation = zns_canon::attestation::verify(&capsule_bytes, &fingerprint, report_bytes)
-        .expect("FATAL: stored attestation");
-    persist_final_outputs(
-        &state,
-        &attestation,
-        Path::new(MANIFEST_FILE),
-        Path::new(MINT_CONFIG_FILE),
-    );
-
-    let state = state.complete();
-    ceremony::store(state_path, &state);
-    tracing::info!(
-        birthday = u32::from(birthday),
-        "manifest and mint config written"
-    );
-    state
-}
-
-/// Write the custody manifest and mint config from the broadcast state.
-///
-/// The Treasury address, anchor txid, and birthday come from `state`. An
-/// existing file is kept only when the new bytes match, so a resumed
-/// finalization is idempotent.
-fn persist_final_outputs(
-    state: &ceremony::CeremonyState,
-    attestation: &zns_canon::attestation::Attestation,
-    manifest_path: &Path,
-    mint_config_path: &Path,
 ) {
-    let fingerprint = *state.fingerprint();
-    let capsule_hash = *state.capsule_hash();
-    let birthday = BlockHeight::from_u32(
-        state
-            .birthday()
-            .expect("FATAL: broadcast anchor has no birthday"),
-    );
     let report_data_hash = blake2b256(&attestation.report_data);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
-    let treasury_address = state
-        .funding_info()
-        .expect("FATAL: ceremony state has no funding address")
+    let treasury_address = sealed
+        .funding
         .address()
         .to_zcash_address(NETWORK.network_type())
         .encode();
-    let anchor_txid = state
-        .txid()
-        .expect("FATAL: broadcast anchor has no txid")
-        .to_string();
     let manifest = custody_manifest(CustodyManifestInputs {
-        fingerprint,
-        capsule_hash: &capsule_hash,
+        fingerprint: sealed.fingerprint,
+        capsule_hash: &sealed.capsule_hash,
         treasury_address: &treasury_address,
-        anchor_txid: &anchor_txid,
-        birthday: u32::from(birthday),
+        anchor_txid: txid,
+        birthday,
         report_data_hash: &report_data_hash,
         attestation_hash: &attestation_hash,
         measurement: &measurement,
         guest_policy: attestation.guest_policy,
         tcb_version: &attestation.tcb_version,
     });
-    let mint_config = mint_config_toml_with_birthday(fingerprint, birthday);
-    write_atomic_verified(manifest_path, manifest.as_bytes(), 0o644);
-    write_atomic_verified(mint_config_path, mint_config.as_bytes(), 0o600);
+    let mint_config =
+        mint_config_toml_with_birthday(sealed.fingerprint, BlockHeight::from_u32(birthday));
+    write_atomic(Path::new(MINT_CONFIG_FILE), mint_config.as_bytes(), 0o600);
+    write_atomic(Path::new(MANIFEST_FILE), manifest.as_bytes(), 0o644);
+    tracing::info!(birthday, "manifest and mint config written");
 }
 
 /// Poll Zebra until the Treasury address is funded.
@@ -782,14 +585,6 @@ impl RngCore for RdseedRng {
 
 // ── File I/O ──────────────────────────────────────────────────────
 
-fn ensure_absent(path: &Path) {
-    match fs::symlink_metadata(path) {
-        Ok(_) => panic!("FATAL: {} already exists", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("FATAL: inspect {}: {e}", path.display()),
-    }
-}
-
 fn write_secret_file(path: &Path, bytes: &[u8]) {
     let mut f = OpenOptions::new()
         .write(true)
@@ -828,32 +623,6 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) {
         )
     });
     sync_parent(path);
-}
-
-/// Create `path` if it is absent. If it already exists, require those exact bytes.
-///
-/// A short file left by a crash does not match, so finalization will not mark
-/// the ceremony complete over it.
-fn write_atomic_verified(path: &Path, expected: &[u8], mode: u32) {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            panic!("FATAL: {} is a symlink", path.display());
-        }
-        Ok(_) => {
-            let existing = fs::read(path)
-                .unwrap_or_else(|error| panic!("FATAL: read {}: {error}", path.display()));
-            assert_eq!(
-                existing,
-                expected,
-                "FATAL: existing {} does not match expected contents",
-                path.display()
-            );
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            write_atomic(path, expected, mode);
-        }
-        Err(error) => panic!("FATAL: inspect {}: {error}", path.display()),
-    }
 }
 
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
@@ -895,18 +664,17 @@ mod tests {
     }
 
     #[test]
-    fn finalizing_twice_copies_the_broadcast_state_into_the_manifest() {
+    fn finalize_writes_the_manifest_and_mint_config() {
         let seed = [0x11u8; SEED_LEN];
         let funding = TreasuryFundingInfo::derive(&NETWORK, &seed);
         let fingerprint = SeedFingerprint::from_seed(&seed).unwrap();
-        let address = funding
-            .address()
-            .to_zcash_address(NETWORK.network_type())
-            .encode();
-        let pubkey = hex::encode(funding.pubkey().serialize());
-        let state = ceremony::CeremonyState::sealed(fingerprint, [0x44; 32], address, pubkey)
-            .anchor_built("ab".repeat(32), "00ff".to_string())
-            .anchor_broadcast(4_408_922);
+        let sealed = SealedCeremony {
+            fingerprint,
+            capsule_hash: [0x44; 32],
+            funding,
+        };
+        let txid = "ab".repeat(32);
+        let birthday = 4_408_922u32;
         let attestation = zns_canon::attestation::Attestation {
             report_bytes: b"snp-report".to_vec(),
             measurement: [0x7a; 48],
@@ -915,91 +683,64 @@ mod tests {
             report_data: [0u8; zns_canon::attestation::REPORT_DATA_LEN],
         };
 
-        let dir =
-            std::env::temp_dir().join(format!("zns-keygen-final-manifest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zns-keygen-finalize-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let manifest_path = dir.join("zns_custody_manifest.toml");
         let mint_path = dir.join("zns_mint.conf");
 
-        persist_final_outputs(&state, &attestation, &manifest_path, &mint_path);
-        let manifest_bytes = fs::read(&manifest_path).unwrap();
-        let mint_bytes = fs::read(&mint_path).unwrap();
-        persist_final_outputs(&state, &attestation, &manifest_path, &mint_path);
-        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
-        assert_eq!(fs::read(&mint_path).unwrap(), mint_bytes);
-
-        let manifest: toml::Value =
-            toml::from_str(std::str::from_utf8(&manifest_bytes).unwrap()).unwrap();
-        let mint: toml::Value = toml::from_str(std::str::from_utf8(&mint_bytes).unwrap()).unwrap();
-        let expected_address = state
-            .funding_info()
-            .unwrap()
+        let report_data_hash = blake2b256(&attestation.report_data);
+        let attestation_hash = blake2b256(&attestation.report_bytes);
+        let measurement = hex::encode(attestation.measurement);
+        let treasury_address = sealed
+            .funding
             .address()
             .to_zcash_address(NETWORK.network_type())
             .encode();
+        let manifest = custody_manifest(CustodyManifestInputs {
+            fingerprint: sealed.fingerprint,
+            capsule_hash: &sealed.capsule_hash,
+            treasury_address: &treasury_address,
+            anchor_txid: &txid,
+            birthday,
+            report_data_hash: &report_data_hash,
+            attestation_hash: &attestation_hash,
+            measurement: &measurement,
+            guest_policy: attestation.guest_policy,
+            tcb_version: &attestation.tcb_version,
+        });
+        let mint_config =
+            mint_config_toml_with_birthday(sealed.fingerprint, BlockHeight::from_u32(birthday));
+        // Mint config first, manifest last: the manifest is the completion record.
+        write_atomic(&mint_path, mint_config.as_bytes(), 0o600);
+        write_atomic(&manifest_path, manifest.as_bytes(), 0o644);
+
+        let manifest: toml::Value =
+            toml::from_str(std::str::from_utf8(&fs::read(&manifest_path).unwrap()).unwrap())
+                .unwrap();
+        let mint: toml::Value =
+            toml::from_str(std::str::from_utf8(&fs::read(&mint_path).unwrap()).unwrap()).unwrap();
         assert_eq!(
             manifest["treasury_address"].as_str().unwrap(),
-            expected_address
+            treasury_address
         );
-        assert_eq!(
-            manifest["anchor_txid"].as_str().unwrap(),
-            state.txid().unwrap()
-        );
-        assert_eq!(
-            u32::try_from(manifest["birthday"].as_integer().unwrap()).unwrap(),
-            state.birthday().unwrap()
-        );
+        assert_eq!(manifest["anchor_txid"].as_str().unwrap(), txid);
+        assert_eq!(manifest["birthday"].as_integer().unwrap(), birthday as i64);
         assert_eq!(
             manifest["seed_fingerprint"].as_str().unwrap(),
-            state.fingerprint().to_string()
+            sealed.fingerprint.to_string()
         );
         assert_eq!(
             manifest["capsule_hash_blake2b256"].as_str().unwrap(),
-            hex::encode(state.capsule_hash())
+            hex::encode(sealed.capsule_hash)
         );
         assert_eq!(
             mint["expected_seed_fingerprint"].as_str().unwrap(),
-            state.fingerprint().to_string()
-        );
-        assert_eq!(
-            u32::try_from(mint["birthday"].as_integer().unwrap()).unwrap(),
-            state.birthday().unwrap()
+            sealed.fingerprint.to_string()
         );
         assert_eq!(mint["birthday"], manifest["birthday"]);
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn atomic_verified_write_rejects_a_short_file() {
-        let dir = std::env::temp_dir().join(format!("zns-keygen-finalize-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("zns_mint.conf");
-        let expected = b"network = \"testnet\"\nbirthday = 4408922\n";
-
-        write_atomic_verified(&path, expected, 0o600);
-        assert_eq!(fs::read(&path).unwrap(), expected);
-        assert!(!temp_sibling(&path).exists());
-
-        write_atomic_verified(&path, expected, 0o600);
-
-        fs::write(&path, b"network = \"test").unwrap();
-        let mismatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            write_atomic_verified(&path, expected, 0o600);
-        }));
-        assert!(mismatched.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"network = \"test");
-
-        let link = dir.join("zns_custody_manifest.toml");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        let symlink = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            write_atomic_verified(&link, expected, 0o644);
-        }));
-        assert!(symlink.is_err());
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

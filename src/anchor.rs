@@ -4,6 +4,7 @@ use blake2b_simd::Hash as Blake2bHash;
 use orchard::builder::{Builder as OrchardBuilder, BundleType};
 use orchard::bundle::BundleVersion;
 use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+use secp256k1::ecdsa::sign;
 use transparent::builder::{TransparentBuilder, TransparentInputInfo};
 use zcash_primitives::transaction::fees::FeeRule as _;
 use zcash_primitives::transaction::fees::transparent::InputView as _;
@@ -15,6 +16,11 @@ use zcash_primitives::transaction::{
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
+
+// rand 0.10 OS entropy. `UnwrapErr` restores rand 0.8 `OsRng`'s panic-on-failure
+// semantics behind the infallible `Rng` bounds orchard 0.16 demands.
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 
 const NUM_ANCHORS: usize = 40;
 const DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
@@ -104,8 +110,9 @@ pub fn build_anchor_transaction<P: Parameters>(
         )
         .expect("FATAL: change output");
 
+    let mut rng = UnwrapErr(SysRng);
     let (ironwood_bundle, _meta) = orchard_builder
-        .build::<ZatBalance>(&mut rand::rngs::OsRng)
+        .build::<ZatBalance>(&mut rng)
         .expect("FATAL: ironwood build")
         .expect("FATAL: bundle exists");
 
@@ -150,9 +157,9 @@ pub fn build_anchor_transaction<P: Parameters>(
     let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
 
     let authorized_ironwood = ironwood_bundle
-        .create_proof(&pk, &mut rand::rngs::OsRng)
+        .create_proof(&pk, &mut rng)
         .expect("FATAL: ironwood proof")
-        .prepare(rand::rngs::OsRng, *shielded_sighash.as_ref())
+        .prepare(rng, *shielded_sighash.as_ref())
         .finalize()
         .expect("FATAL: ironwood finalize");
 
@@ -179,9 +186,7 @@ fn authorize_transparent(
     txid_parts: &TxDigests<Blake2bHash>,
     treasury_sk: &mut secp256k1::SecretKey,
 ) -> transparent::bundle::Bundle<transparent::bundle::Authorized> {
-    let verify_ctx = secp256k1::Secp256k1::verification_only();
     let signatures = {
-        let sign_ctx = secp256k1::Secp256k1::signing_only();
         let signed: Result<
             Vec<secp256k1::ecdsa::Signature>,
             transparent::sighash::InvalidInputIndex,
@@ -204,7 +209,7 @@ fn authorize_transparent(
                     txid_parts,
                 );
                 let msg = secp256k1::Message::from_digest(*sighash.as_ref());
-                Ok(sign_ctx.sign_ecdsa(&msg, treasury_sk))
+                Ok(sign(msg, treasury_sk))
             })
             .collect();
         treasury_sk.non_secure_erase();
@@ -212,13 +217,9 @@ fn authorize_transparent(
     };
 
     bundle
-        .prepare_transparent_signatures(
-            |input| {
-                *signature_hash(unauthed_tx, &SignableInput::Transparent(input), txid_parts)
-                    .as_ref()
-            },
-            &verify_ctx,
-        )
+        .prepare_transparent_signatures(|input| {
+            *signature_hash(unauthed_tx, &SignableInput::Transparent(input), txid_parts).as_ref()
+        })
         .expect("FATAL: prepare transparent signatures")
         .append_external_signatures(&signatures)
         .expect("FATAL: transparent signature")
@@ -228,7 +229,8 @@ fn authorize_transparent(
 
 #[cfg(test)]
 mod tests {
-    use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+    use secp256k1::ecdsa;
+    use secp256k1::{Message, PublicKey, SecretKey};
     use transparent::address::TransparentAddress;
     use transparent::builder::{SpendInfo, TransparentBuilder, TransparentInputInfo};
     use transparent::bundle::{OutPoint, TxOut};
@@ -253,8 +255,8 @@ mod tests {
 
     #[test]
     fn transparent_signatures_verify_and_signing_key_is_erased() {
-        let mut sk = SecretKey::from_slice(&[2u8; 32]).expect("signing key");
-        let pubkey = PublicKey::from_secret_key(&Secp256k1::signing_only(), &sk);
+        let mut sk = SecretKey::from_secret_bytes([2u8; 32]).expect("signing key");
+        let pubkey = PublicKey::from_secret_key(&sk);
         let inputs = vec![
             p2pkh_input(pubkey, 1, 250_000),
             p2pkh_input(pubkey, 2, 250_000),
@@ -280,12 +282,11 @@ mod tests {
         let authorized = authorize_transparent(bundle, &inputs, &unauthed, &txid_parts, &mut sk);
 
         assert_eq!(
-            sk.as_ref(),
-            &[1u8; 32],
+            sk.to_secret_bytes(),
+            [1u8; 32],
             "signing key should be overwritten after signing"
         );
 
-        let verify = Secp256k1::verification_only();
         let unauth_bundle = unauthed.transparent_bundle().expect("transparent bundle");
         assert_eq!(authorized.vin.len(), inputs.len());
         for (index, txin) in authorized.vin.iter().enumerate() {
@@ -307,15 +308,36 @@ mod tests {
             let bytes = txin.script_sig().0.to_bytes();
             let sig_len = bytes[0] as usize;
             let pushed = &bytes[1..1 + sig_len];
-            let signature = secp256k1::ecdsa::Signature::from_der(&pushed[..pushed.len() - 1])
-                .expect("DER signature");
-            verify
-                .verify_ecdsa(
-                    &Message::from_digest(*sighash.as_ref()),
-                    &signature,
-                    &pubkey,
-                )
+            let signature =
+                ecdsa::Signature::from_der(&pushed[..pushed.len() - 1]).expect("DER signature");
+            ecdsa::verify(&signature, Message::from_digest(*sighash.as_ref()), &pubkey)
                 .expect("signature verifies");
         }
+    }
+
+    /// Mainnet NU7 activation is unset in zcash_protocol 0.11.0-pre; heights past
+    /// Nu6.3 activation must keep signing with the Nu6.3 branch ID.
+    #[test]
+    fn mainnet_keeps_nu6_3_branch_id() {
+        let height = BlockHeight::from_u32(5_000_000);
+        assert_eq!(
+            u32::from(BranchId::for_height(&MAIN_NETWORK, height)),
+            0x37a5_165b,
+        );
+    }
+
+    /// ZIP 259: NU7 activates on testnet at height 4465026 with consensus
+    /// branch ID 0x77190ad9. Signing with anything else is rejected at
+    /// mempool consensus validation — the bug this bump fixes.
+    #[test]
+    #[cfg(feature = "testnet")]
+    fn testnet_signs_with_nu7_branch_id_after_activation() {
+        use zcash_protocol::consensus::TEST_NETWORK;
+
+        let height = BlockHeight::from_u32(4_465_026);
+        assert_eq!(
+            u32::from(BranchId::for_height(&TEST_NETWORK, height)),
+            0x7719_0ad9,
+        );
     }
 }

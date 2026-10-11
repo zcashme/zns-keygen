@@ -25,16 +25,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
-zcash_protocol = { version = "0.10.4", default-features = false }
-zcash_address = "0.13.0"
-zcash_primitives = { version = "0.30.0", default-features = false, features = ["transparent-inputs"] }
-sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-orchard = { version = "0.15.5", default-features = false, features = ["circuit"] }
-transparent = { package = "zcash_transparent", version = "0.10.0", default-features = false }
-zip32 = "0.2.1"
-rand = "0.8"
-secp256k1 = "0.29"
-zcash_script = "0.4"
+# Pinned exactly to the librustzcash 0.11.0-pre line: this is the first release
+# line that knows NU7 is active on testnet (height 4465026, branch ID 0x77190ad9).
+# 0.10.x signs with the NU6.3 branch ID and the node rejects it.
+# Relax these pins when 0.11.0 final ships.
+zcash_protocol = { version = "=0.11.0-pre.0", default-features = false }
+zcash_address = "=0.14.0-pre.1"
+zcash_primitives = { version = "=0.31.0-pre.1", default-features = false, features = ["transparent-inputs"] }
+sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
+orchard = { version = "0.16.0", default-features = false, features = ["circuit"] }
+transparent = { package = "zcash_transparent", version = "=0.11.0-pre.1", default-features = false }
+zip32 = "0.3"
+rand = "0.10"
+secp256k1 = "0.33"
+zcash_script = "0.6"
 
 [dev-dependencies]
-zcash_keys = { version = "0.16.1", default-features = false, features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_keys = { version = "=0.17.0-pre.1", default-features = false, features = ["orchard", "sapling", "transparent-inputs"] }

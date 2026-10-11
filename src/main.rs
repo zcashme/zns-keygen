@@ -6,7 +6,7 @@ mod keys;
 mod rpc;
 
 use blake2b_simd::Params as Blake2bParams;
-use rand::RngCore;
+use rand::{TryCryptoRng, TryRng};
 use secrecy::{ExposeSecret, Secret};
 use std::fs::{self, File, OpenOptions};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -757,28 +757,28 @@ fn generate_seed() -> Secret<[u8; SEED_LEN]> {
 /// Nonce source for capsule sealing. The seed itself is drawn separately.
 struct RdseedRng;
 
-impl RngCore for RdseedRng {
-    fn next_u32(&mut self) -> u32 {
+impl TryRng for RdseedRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut bytes = [0u8; 4];
-        self.fill_bytes(&mut bytes);
-        u32::from_ne_bytes(bytes)
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u32::from_ne_bytes(bytes))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut bytes = [0u8; 8];
-        self.fill_bytes(&mut bytes);
-        u64::from_ne_bytes(bytes)
+        self.try_fill_bytes(&mut bytes)?;
+        Ok(u64::from_ne_bytes(bytes))
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         fill_entropy(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
+
+impl TryCryptoRng for RdseedRng {}
 
 // ── File I/O ──────────────────────────────────────────────────────
 

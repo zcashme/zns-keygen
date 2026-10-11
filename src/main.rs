@@ -15,8 +15,12 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
+use transparent::address::{Script, TransparentAddress};
+use transparent::builder::{SpendInfo, TransparentInputInfo};
+use transparent::bundle::{OutPoint, TxOut};
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
+use zcash_script::script::Code;
 use zeroize::Zeroize;
 use zip32::fingerprint::SeedFingerprint;
 use zns_canon::capsule::{self, MAGIC as CAPSULE_MAGIC, SEED_LEN};
@@ -517,27 +521,27 @@ fn persist_final_outputs(
 ///
 /// Takes only the public funding address and pubkey. Spending keys are not
 /// in scope for this wait.
-fn poll_until_funded(
-    funding: &TreasuryFundingInfo,
-) -> Vec<transparent::builder::TransparentInputInfo> {
-    let pubkey = funding.pubkey();
+fn poll_until_funded(funding: &TreasuryFundingInfo) -> Vec<TransparentInputInfo> {
     loop {
-        match check_funding(funding.address()) {
-            Some(raw) => {
-                let built: Vec<_> = raw.into_iter().map(|u| utxo_to_input(&u, pubkey)).collect();
-                tracing::info!(inputs = built.len(), "funding sufficient");
-                return built;
+        if let Some(raw) = check_funding(funding.address()) {
+            let built: Result<Vec<_>, String> = raw
+                .iter()
+                .map(|u| utxo_to_input(u, funding.pubkey()))
+                .collect();
+            match built {
+                Ok(built) => {
+                    tracing::info!(inputs = built.len(), "funding sufficient");
+                    return built;
+                }
+                Err(error) => tracing::warn!(%error, "malformed funding UTXO; retrying"),
             }
-            None => std::thread::sleep(POLL_INTERVAL),
         }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 /// Check for sufficient UTXOs.
-///
-/// An empty address is "no funding yet". A Zebra failure is logged and
-/// retried by the caller. It is not treated as an empty address.
-fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
+fn check_funding(addr: &TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
     let encoded = addr.to_zcash_address(NETWORK.network_type()).encode();
     match funding_utxos(rpc::Rpc::address_utxos(&encoded)) {
         Ok(Some(utxos)) => Some(utxos),
@@ -571,24 +575,22 @@ fn funding_utxos(
 fn utxo_to_input(
     u: &rpc::AddressUtxo,
     pubkey: secp256k1::PublicKey,
-) -> transparent::builder::TransparentInputInfo {
-    let mut txid_bytes = hex::decode(&u.txid).expect("FATAL: txid hex");
-    txid_bytes.reverse();
-    let mut txid_arr = [0u8; 32];
-    txid_arr.copy_from_slice(&txid_bytes);
+) -> Result<TransparentInputInfo, String> {
+    let mut txid = [0u8; 32];
+    hex::decode_to_slice(&u.txid, &mut txid).map_err(|error| format!("txid hex: {error}"))?;
+    txid.reverse();
 
-    let outpoint = transparent::bundle::OutPoint::new(txid_arr, u.output_index);
-    let value = Zatoshis::from_u64(u.satoshis).expect("FATAL: satoshis");
-    let script_bytes = hex::decode(&u.script).expect("FATAL: script hex");
-    let script = transparent::address::Script(zcash_script::script::Code(script_bytes));
-    let coin = transparent::bundle::TxOut::new(value, script);
+    let script_bytes = hex::decode(&u.script).map_err(|error| format!("script hex: {error}"))?;
+    let script = Script(Code(script_bytes));
+    let value = Zatoshis::from_u64(u.satoshis).map_err(|error| format!("satoshis: {error}"))?;
+    let coin = TxOut::new(value, script);
 
-    transparent::builder::TransparentInputInfo::from_parts(
-        outpoint,
+    TransparentInputInfo::from_parts(
+        OutPoint::new(txid, u.output_index),
         coin,
-        transparent::builder::SpendInfo::P2pkh { pubkey },
+        SpendInfo::P2pkh { pubkey },
     )
-    .expect("FATAL: transparent input")
+    .map_err(|error| format!("transparent input: {error:?}"))
 }
 
 // ── Manifest ──────────────────────────────────────────────────────

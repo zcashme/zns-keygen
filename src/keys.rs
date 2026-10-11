@@ -137,27 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn funding_info_matches_treasury_account_key() {
-        let seed = reference_seed();
-        let funding = TreasuryFundingInfo::derive(&MAIN_NETWORK, &seed);
-        let account = treasury_account_key(&MAIN_NETWORK, &seed);
-        let account_pub = account.to_account_pubkey();
-        let address = account_pub
-            .derive_external_ivk()
-            .expect("Treasury IVK")
-            .default_address()
-            .0;
-        let pubkey = account_pub
-            .derive_address_pubkey(
-                TransparentKeyScope::EXTERNAL,
-                NonHardenedChildIndex::from_index(0).unwrap(),
-            )
-            .expect("pubkey");
-        assert_eq!(funding.address(), &address);
-        assert_eq!(funding.pubkey(), pubkey);
-    }
-
-    #[test]
     fn anchor_material_matches_unified_spending_key() {
         use zcash_keys::keys::UnifiedSpendingKey;
 

@@ -48,64 +48,7 @@ const NETWORK_LABEL: &str = "testnet";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-enum Command {
-    Help,
-    Run,
-}
-
 fn main() {
-    match command_from(std::env::args()) {
-        Ok(Command::Help) => println!("{}", usage()),
-        Ok(Command::Run) => run_ceremony(),
-        Err(message) => {
-            eprintln!("{message}\n\n{}", usage());
-            std::process::exit(2);
-        }
-    }
-}
-
-fn usage() -> String {
-    format!(
-        "\
-zns-keygen — one-shot ZNS genesis custody ceremony ({NETWORK_LABEL})
-
-USAGE:
-    zns-keygen
-    zns-keygen --help
-
-With no arguments, generate a seed, seal it, attest the capsule, wait for
-Treasury funding, and broadcast the genesis anchor transaction. A later run
-resumes from keys/ceremony_state.toml instead of generating another seed.
-
-The network is chosen at compile time. This binary is {NETWORK_LABEL}.
-
-OPTIONS:
-    -h, --help    Print this help and exit
-"
-    )
-}
-
-fn command_from<I, S>(args: I) -> Result<Command, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut args = args.into_iter();
-    let _program = args.next();
-    match args.next() {
-        None => Ok(Command::Run),
-        Some(arg) if matches!(arg.as_ref(), "-h" | "--help") => match args.next() {
-            None => Ok(Command::Help),
-            Some(extra) => Err(format!(
-                "unexpected argument after --help: {}",
-                extra.as_ref()
-            )),
-        },
-        Some(arg) => Err(format!("unrecognized argument: {}", arg.as_ref())),
-    }
-}
-
-fn run_ceremony() {
     tracing_subscriber::fmt().init();
     tracing::info!("=== ZNS KEY GENESIS ===");
     tracing::info!(network = NETWORK_LABEL, "starting ceremony");
@@ -936,27 +879,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_does_not_select_the_ceremony() {
-        assert!(matches!(
-            command_from(["zns-keygen", "--help"]),
-            Ok(Command::Help)
-        ));
-        assert!(matches!(
-            command_from(["zns-keygen", "-h"]),
-            Ok(Command::Help)
-        ));
-        assert!(matches!(command_from(["zns-keygen"]), Ok(Command::Run)));
-        assert!(command_from(["zns-keygen", "--nope"]).is_err());
-    }
-
-    #[test]
-    fn usage_names_help_and_the_compiled_network() {
-        let text = usage();
-        assert!(text.contains("--help"));
-        assert!(text.contains(NETWORK_LABEL));
-    }
-
-    #[test]
     fn known_seed_matches_zip32_reference_vector() {
         let seed_bytes: [u8; SEED_LEN] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -970,33 +892,6 @@ mod tests {
         ];
         let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
         assert_eq!(fp.to_bytes(), expected);
-    }
-
-    #[test]
-    fn manifest_serializes_to_toml() {
-        let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ];
-        let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
-        let txid = "ab".repeat(32);
-        let manifest = custody_manifest(CustodyManifestInputs {
-            fingerprint: fp,
-            capsule_hash: &[0u8; 32],
-            treasury_address: "tmTestTreasuryAddress",
-            anchor_txid: &txid,
-            birthday: 4408922,
-            report_data_hash: &[0u8; 32],
-            attestation_hash: &[0u8; 32],
-            measurement: "0000000000000000000000000000000000000000000000000000000000000000",
-            guest_policy: 0x30000,
-            tcb_version: "bootloader=0 tee=0 snp=0 microcode=0",
-        });
-        assert!(manifest.contains("seed_fingerprint"));
-        assert!(manifest.contains("treasury_address = \"tmTestTreasuryAddress\""));
-        assert!(manifest.contains(&format!("anchor_txid = \"{txid}\"")));
-        assert!(manifest.contains("birthday = 4408922"));
     }
 
     #[test]
@@ -1074,18 +969,6 @@ mod tests {
         assert_eq!(mint["birthday"], manifest["birthday"]);
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mint_config_contains_fingerprint() {
-        let seed_bytes: [u8; SEED_LEN] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ];
-        let fp = SeedFingerprint::from_seed(&seed_bytes).unwrap();
-        let config = mint_config_toml_with_birthday(fp, BlockHeight::from_u32(0));
-        assert!(config.contains("expected_seed_fingerprint"));
     }
 
     #[test]

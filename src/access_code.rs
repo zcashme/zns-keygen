@@ -15,21 +15,10 @@ use secrecy::{ExposeSecret, Secret};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
+use zns_canon::access_code::{ISSUER_PUBLIC_KEY, purpose, seed_scalar};
 use zns_canon::capsule::{self, CAPSULE_KEY_CONTEXT, SEED_LEN};
 
 const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
-
-/// The issuer public key. The seed-derived private key agrees with this.
-const ISSUER_PUBKEY: [u8; 32] = [
-    0xfb, 0xd1, 0x2e, 0xed, 0x08, 0xb8, 0xc1, 0xe3, 0x43, 0xab, 0x4b, 0x98, 0x22, 0x82, 0x1d, 0x51,
-    0x13, 0xb0, 0xe3, 0xa7, 0x11, 0x00, 0x1d, 0x81, 0xed, 0xb8, 0xd5, 0xcf, 0xa3, 0x4e, 0xab, 0x52,
-];
-
-/// Domain separating the access-code scalar from every spending key.
-const SCALAR_DOMAIN: &[u8] = b"ZNS/access-code/x25519/v1";
-
-/// Mint `AccessCodeDerivationKey::from_private_key` domain.
-const PURPOSE: &[u8] = b"access-code-v1";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -64,7 +53,7 @@ fn code_for_name(name: &str) -> u32 {
     }
     let seed = open_seed();
     let secret = private_key_from_seed(seed.expose_secret());
-    let shared = shared_secret(secret.expose_secret(), &ISSUER_PUBKEY)
+    let shared = shared_secret(secret.expose_secret(), &ISSUER_PUBLIC_KEY)
         .unwrap_or_else(|error| panic!("FATAL: {error}"));
     access_code(shared.expose_secret(), name)
 }
@@ -88,10 +77,7 @@ fn open_seed() -> Secret<[u8; SEED_LEN]> {
 }
 
 fn private_key_from_seed(seed: &[u8; SEED_LEN]) -> Secret<[u8; 32]> {
-    let mut scalar = hmac_sha256(seed, SCALAR_DOMAIN);
-    let secret = Secret::new(scalar);
-    scalar.zeroize();
-    secret
+    Secret::new(*seed_scalar(seed))
 }
 
 fn public_key(private_key: &[u8; 32]) -> [u8; 32] {
@@ -112,9 +98,8 @@ fn shared_secret(
 
 /// The six-digit code the mint accepts for `name`.
 fn access_code(shared: &[u8; 32], name: &str) -> u32 {
-    let mut purpose = hmac_sha256(shared, PURPOSE);
-    let mut digest = hmac_sha256(&purpose, name.as_bytes());
-    purpose.zeroize();
+    let gate = purpose(shared);
+    let mut digest = hmac_sha256(&*gate, name.as_bytes());
     let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
     digest.zeroize();
     n % 1_000_000
@@ -146,9 +131,9 @@ mod tests {
     #[test]
     fn mint_judge_accepts_these_codes() {
         let key = vector_key();
-        let purpose = hmac_sha256(&key, PURPOSE);
+        let gate = purpose(&key);
         assert_eq!(
-            hex::encode(purpose),
+            hex::encode(*gate),
             "5e2db6040cd32d2486675a3b3d60b9d4d96e9c8d4a5f862e0dfd7bd6a3f57b91"
         );
         assert_eq!(access_code(&key, "alice"), 352_582);

@@ -1,5 +1,6 @@
 //! zns-keygen — ZNS mint key genesis ceremony.
 
+mod access_code;
 mod anchor;
 mod ceremony;
 mod keys;
@@ -49,6 +50,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 fn main() {
     tracing_subscriber::fmt().init();
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("access-code") {
+        access_code::run(args);
+        return;
+    }
     tracing::info!("=== ZNS KEY GENESIS ===");
     tracing::info!(network = NETWORK_LABEL, "starting ceremony");
 
@@ -98,6 +104,9 @@ fn wipe_incomplete() {
 }
 
 /// Generate the seed, seal the capsule, and derive the Treasury funding info.
+///
+/// The capsule is the seed alone. Access codes are a separate procedure and
+/// never enter this seal.
 fn seal_seed() -> SealedCeremony {
     let (fingerprint, capsule_hash, funding) = {
         let seed = generate_seed();
@@ -706,6 +715,13 @@ mod tests {
             hex::encode(sealed.capsule_hash)
         );
         assert_eq!(manifest["network"].as_str().unwrap(), NETWORK_LABEL);
+        assert!(manifest.get("access_code_key_file").is_none());
+        assert!(manifest.get("access_code_key_recipient").is_none());
+        assert!(
+            manifest
+                .get("access_code_key_enc_hash_blake2b256")
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

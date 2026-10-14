@@ -15,7 +15,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
-use zcash_protocol::consensus::{BlockHeight, Parameters};
+use zcash_protocol::consensus::Parameters;
 use zcash_protocol::value::Zatoshis;
 use zeroize::Zeroize;
 use zip32::fingerprint::SeedFingerprint;
@@ -26,7 +26,6 @@ use keys::{AnchorMaterial, TreasuryFundingInfo};
 const KEYS_DIR: &str = "keys";
 const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
 const MANIFEST_FILE: &str = "keys/zns_custody_manifest.toml";
-const MINT_CONFIG_FILE: &str = "keys/zns_mint.conf";
 const ATTESTATION_FILE: &str = "keys/zns_attestation.bin";
 
 const TREASURY_ACCOUNT: u32 = 0;
@@ -87,7 +86,7 @@ fn wipe_incomplete() {
     for path in [
         CAPSULE_FILE,
         ATTESTATION_FILE,
-        MINT_CONFIG_FILE,
+        "keys/zns_mint.conf",
         "keys/ceremony_state.toml",
     ] {
         match fs::remove_file(path) {
@@ -281,8 +280,8 @@ fn anchor_lookup(txid: &str) -> ceremony::AnchorLookup {
     }
 }
 
-/// Write the mint config, then the custody manifest last: the manifest's
-/// existence is the completion record.
+/// Write the custody manifest: the mint's ceremony input, and its existence
+/// is the completion record.
 fn finalize(
     sealed: &SealedCeremony,
     attestation: &zns_canon::attestation::Attestation,
@@ -309,11 +308,8 @@ fn finalize(
         guest_policy: attestation.guest_policy,
         tcb_version: &attestation.tcb_version,
     });
-    let mint_config =
-        mint_config_toml_with_birthday(sealed.fingerprint, BlockHeight::from_u32(birthday));
-    write_atomic(Path::new(MINT_CONFIG_FILE), mint_config.as_bytes(), 0o600);
     write_atomic(Path::new(MANIFEST_FILE), manifest.as_bytes(), 0o644);
-    tracing::info!(birthday, "manifest and mint config written");
+    tracing::info!(birthday, "manifest written");
 }
 
 /// Poll Zebra until the Treasury address is funded.
@@ -467,24 +463,6 @@ fn custody_manifest(inputs: CustodyManifestInputs<'_>) -> String {
         signer_socket: "none",
     };
     toml::to_string(&m).expect("FATAL: serialize custody manifest")
-}
-
-// ── Mint config ───────────────────────────────────────────────────
-
-#[derive(serde::Serialize)]
-struct MintConfigWithBirthday {
-    network: &'static str,
-    expected_seed_fingerprint: String,
-    birthday: u32,
-}
-
-fn mint_config_toml_with_birthday(fingerprint: SeedFingerprint, birthday: BlockHeight) -> String {
-    toml::to_string(&MintConfigWithBirthday {
-        network: NETWORK_LABEL,
-        expected_seed_fingerprint: fingerprint.to_string(),
-        birthday: u32::from(birthday),
-    })
-    .expect("FATAL: serialize mint config")
 }
 
 // ── Hashing ───────────────────────────────────────────────────────
@@ -664,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_writes_the_manifest_and_mint_config() {
+    fn finalize_writes_the_manifest() {
         let seed = [0x11u8; SEED_LEN];
         let funding = TreasuryFundingInfo::derive(&NETWORK, &seed);
         let fingerprint = SeedFingerprint::from_seed(&seed).unwrap();
@@ -687,7 +665,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let manifest_path = dir.join("zns_custody_manifest.toml");
-        let mint_path = dir.join("zns_mint.conf");
 
         let report_data_hash = blake2b256(&attestation.report_data);
         let attestation_hash = blake2b256(&attestation.report_bytes);
@@ -709,17 +686,11 @@ mod tests {
             guest_policy: attestation.guest_policy,
             tcb_version: &attestation.tcb_version,
         });
-        let mint_config =
-            mint_config_toml_with_birthday(sealed.fingerprint, BlockHeight::from_u32(birthday));
-        // Mint config first, manifest last: the manifest is the completion record.
-        write_atomic(&mint_path, mint_config.as_bytes(), 0o600);
         write_atomic(&manifest_path, manifest.as_bytes(), 0o644);
 
         let manifest: toml::Value =
             toml::from_str(std::str::from_utf8(&fs::read(&manifest_path).unwrap()).unwrap())
                 .unwrap();
-        let mint: toml::Value =
-            toml::from_str(std::str::from_utf8(&fs::read(&mint_path).unwrap()).unwrap()).unwrap();
         assert_eq!(
             manifest["treasury_address"].as_str().unwrap(),
             treasury_address
@@ -734,11 +705,7 @@ mod tests {
             manifest["capsule_hash_blake2b256"].as_str().unwrap(),
             hex::encode(sealed.capsule_hash)
         );
-        assert_eq!(
-            mint["expected_seed_fingerprint"].as_str().unwrap(),
-            sealed.fingerprint.to_string()
-        );
-        assert_eq!(mint["birthday"], manifest["birthday"]);
+        assert_eq!(manifest["network"].as_str().unwrap(), NETWORK_LABEL);
 
         let _ = fs::remove_dir_all(&dir);
     }

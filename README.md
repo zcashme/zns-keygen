@@ -37,8 +37,7 @@ When the ceremony runs, `zns-keygen`:
    is already complete and `zns-keygen` exits successfully without touching
    anything.
 2. Removes any artifacts of an incomplete ceremony (`keys/zns_seed.capsule`,
-   `keys/zns_attestation.bin`, `keys/zns_mint.conf`), so every run starts
-   from a clean slate.
+   `keys/zns_attestation.bin`), so every run starts from a clean slate.
 3. Generates a fresh 32-byte seed using `RDSEED`.
 4. Computes the ZIP-32 seed fingerprint locally:
    `BLAKE2b-256(personal="Zcash_HD_Seed_FP", [seed_len] || seed)`, displayed as
@@ -71,13 +70,12 @@ When the ceremony runs, `zns-keygen`:
     transaction or reports it only on a side chain, keygen broadcasts the
     same transaction again. If Zebra rejects it as expired, the run fails;
     the next start wipes and builds a fresh ceremony.
-12. Writes `keys/zns_mint.conf` and then `keys/zns_custody_manifest.toml`,
-    and exits. The manifest is written last: its existence is the completion
-    record.
+12. Writes `keys/zns_custody_manifest.toml` and exits. The manifest is
+    written last: its existence is the completion record.
 
 The ordering is:
 
-`generate seed → seal capsule → request, verify, and persist the attestation → wait for funding → unseal → build and sign the anchor → broadcast → wait for 10 confirmations → write mint config and custody manifest → exit`
+`generate seed → seal capsule → request, verify, and persist the attestation → wait for funding → unseal → build and sign the anchor → broadcast → wait for 10 confirmations → write custody manifest → exit`
 
 Restarts are wipe-and-retry. The manifest is the only completion record: a
 boot that finds it exits successfully, and a boot that does not removes every
@@ -96,7 +94,6 @@ Defaults:
 ```text
 capsule:      keys/zns_seed.capsule
 manifest:     keys/zns_custody_manifest.toml
-mint_config:  keys/zns_mint.conf
 attestation:  keys/zns_attestation.bin
 ```
 
@@ -117,15 +114,11 @@ The fingerprint is stored in plaintext so that `zns-mint` can identify which
 capsule it has without decrypting. It is not secret; the seed fingerprint is
 also published in the manifest.
 
-## Mint config
+## Mint input
 
-`keys/zns_mint.conf` is a TOML file written by `zns-keygen` containing:
-
-```toml
-network = "mainnet"
-expected_seed_fingerprint = "zip32seedfp..."
-birthday = 1234567
-```
+`zns-mint` reads `keys/zns_custody_manifest.toml` on startup: `network`,
+`seed_fingerprint`, `anchor_txid`, and `birthday`. It refuses to run if the
+decrypted seed's fingerprint does not match `seed_fingerprint`.
 
 `birthday` is the best-chain block height that contains the genesis anchor
 transaction, the transaction that creates the 40 Registry anchors. It is
@@ -133,9 +126,6 @@ written only after that transaction has 10 confirmations. A broadcast, a
 mempool entry, or the chain tip does not establish it. Before those 10
 confirmations a reorg can move the transaction, and the ceremony keeps waiting
 for the later best-chain inclusion. Once written, the value stays fixed.
-
-`zns-mint` reads this on startup and refuses to run if the decrypted seed's
-fingerprint does not match `expected_seed_fingerprint`.
 
 ## AAD and context binding
 
@@ -159,8 +149,7 @@ format, sealing policy, and attestation metadata. It never contains the seed.
 
 `treasury_address` is the transparent address shown during the funding wait.
 `anchor_txid` is the display id of the transaction stored before broadcast.
-`birthday` is that transaction's confirmed inclusion height, the same value
-written to `keys/zns_mint.conf`. The attestation report stays in
+`birthday` is that transaction's confirmed inclusion height. The attestation report stays in
 `keys/zns_attestation.bin`; the manifest records its hash.
 
 The current account allocation is:
@@ -208,9 +197,7 @@ The report signature algorithm is ECDSA P-384 / SHA-384.
 
 The attestation report and custody manifest are written with mode `0644`
 (world-readable) so third-party verification tools can read them without
-root. The capsule, ceremony state, and mint config are written with mode
-`0600` (owner only). Ceremony state holds the Treasury address and, once the
-anchor exists, the signed transaction, txid, and birthday.
+root. The capsule is written with mode `0600` (owner only).
 
 ## Entropy
 

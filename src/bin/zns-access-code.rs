@@ -1,0 +1,190 @@
+//! Access codes, separate from the seed ceremony.
+//!
+//! The private key is `HMAC-SHA256(seed, "ZNS/access-code/x25519/v1")`.
+//! Running this tool with no arguments unseals the seed capsule, prints
+//! that key's X25519 public key, and drops the seed. Nothing is written.
+//! The issuer agrees their private key with the printed public key.
+//!
+//! `code <name>` derives the same private key and agrees it with the issuer's
+//! public key. The mint judges a name with that shared secret:
+//! `purpose = HMAC-SHA256(shared, "access-code-v1")`, then
+//! `u32_be(HMAC-SHA256(purpose, name)[0..4]) mod 1_000_000`.
+
+use hmac::{Hmac, Mac};
+use secrecy::{ExposeSecret, Secret};
+use sha2::Sha256;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
+use zns_canon::capsule::{self, CAPSULE_KEY_CONTEXT, SEED_LEN};
+
+const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
+
+/// The issuer public key. The seed-derived private key agrees with this.
+const ISSUER_PUBKEY: [u8; 32] = [
+    0xfb, 0xd1, 0x2e, 0xed, 0x08, 0xb8, 0xc1, 0xe3, 0x43, 0xab, 0x4b, 0x98, 0x22, 0x82, 0x1d, 0x51,
+    0x13, 0xb0, 0xe3, 0xa7, 0x11, 0x00, 0x1d, 0x81, 0xed, 0xb8, 0xd5, 0xcf, 0xa3, 0x4e, 0xab, 0x52,
+];
+
+/// Domain separating the access-code scalar from every spending key.
+const SCALAR_DOMAIN: &[u8] = b"ZNS/access-code/x25519/v1";
+
+/// Mint `AccessCodeDerivationKey::from_private_key` domain.
+const PURPOSE: &[u8] = b"access-code-v1";
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn main() {
+    tracing_subscriber::fmt().init();
+    let mut args = std::env::args().skip(1);
+    match (args.next().as_deref(), args.next()) {
+        (None, None) => print_public_key(),
+        (Some("code"), Some(name)) => {
+            if args.next().is_some() {
+                usage();
+            }
+            println!("{:06}", code_for_name(&name));
+        }
+        _ => usage(),
+    }
+}
+
+fn usage() -> ! {
+    panic!("FATAL: usage: zns-access-code | zns-access-code code <name>");
+}
+
+fn print_public_key() {
+    let public = access_public_key();
+    tracing::info!("access-code public key: {}", hex::encode(public));
+}
+
+fn code_for_name(name: &str) -> u32 {
+    if name.is_empty() {
+        panic!("FATAL: access code name is empty");
+    }
+    let seed = open_seed();
+    let secret = private_key_from_seed(seed.expose_secret());
+    let shared = shared_secret(secret.expose_secret(), &ISSUER_PUBKEY)
+        .unwrap_or_else(|error| panic!("FATAL: {error}"));
+    access_code(shared.expose_secret(), name)
+}
+
+fn access_public_key() -> [u8; 32] {
+    let seed = open_seed();
+    let secret = private_key_from_seed(seed.expose_secret());
+    public_key(secret.expose_secret())
+}
+
+/// Read the ceremony capsule and unseal the seed. The file is not modified.
+fn open_seed() -> Secret<[u8; SEED_LEN]> {
+    let capsule_bytes = capsule::read_capsule_file(CAPSULE_FILE)
+        .unwrap_or_else(|error| panic!("FATAL: read capsule: {error}"));
+    let capsule = capsule::parse_capsule(&capsule_bytes)
+        .unwrap_or_else(|error| panic!("FATAL: parse capsule: {error}"));
+    let sealing_key = zns_canon::sealing::derive_sealing_key(CAPSULE_KEY_CONTEXT)
+        .unwrap_or_else(|error| panic!("FATAL: derive sealing key: {error}"));
+    capsule::unseal_seed(&sealing_key, &capsule)
+        .unwrap_or_else(|error| panic!("FATAL: unseal capsule: {error}"))
+}
+
+fn private_key_from_seed(seed: &[u8; SEED_LEN]) -> Secret<[u8; 32]> {
+    let mut scalar = hmac_sha256(seed, SCALAR_DOMAIN);
+    let secret = Secret::new(scalar);
+    scalar.zeroize();
+    secret
+}
+
+fn public_key(private_key: &[u8; 32]) -> [u8; 32] {
+    PublicKey::from(&StaticSecret::from(*private_key)).to_bytes()
+}
+
+fn shared_secret(
+    our_private: &[u8; 32],
+    their_public: &[u8; 32],
+) -> Result<Secret<[u8; 32]>, &'static str> {
+    let ours = StaticSecret::from(*our_private);
+    let shared = ours.diffie_hellman(&PublicKey::from(*their_public));
+    if !shared.was_contributory() {
+        return Err("X25519 shared secret is not contributory");
+    }
+    Ok(Secret::new(shared.to_bytes()))
+}
+
+/// The six-digit code the mint accepts for `name`.
+fn access_code(shared: &[u8; 32], name: &str) -> u32 {
+    let mut purpose = hmac_sha256(shared, PURPOSE);
+    let mut digest = hmac_sha256(&purpose, name.as_bytes());
+    purpose.zeroize();
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    digest.zeroize();
+    n % 1_000_000
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&out);
+    digest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vector_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        key
+    }
+
+    #[test]
+    fn mint_judge_accepts_these_codes() {
+        let key = vector_key();
+        let purpose = hmac_sha256(&key, PURPOSE);
+        assert_eq!(
+            hex::encode(purpose),
+            "5e2db6040cd32d2486675a3b3d60b9d4d96e9c8d4a5f862e0dfd7bd6a3f57b91"
+        );
+        assert_eq!(access_code(&key, "alice"), 352_582);
+        assert_eq!(access_code(&key, "bob"), 131_624);
+    }
+
+    #[test]
+    fn the_public_key_is_determined_by_the_seed() {
+        let seed = [0x11; SEED_LEN];
+        let first = private_key_from_seed(&seed);
+        let second = private_key_from_seed(&seed);
+        assert_eq!(first.expose_secret(), second.expose_secret());
+        assert_ne!(first.expose_secret(), &seed);
+        assert_eq!(
+            public_key(first.expose_secret()),
+            public_key(second.expose_secret())
+        );
+    }
+
+    #[test]
+    fn issuer_and_seed_derive_the_same_code() {
+        let seed = [0x22; SEED_LEN];
+        let keygen = private_key_from_seed(&seed);
+        let issuer = [2u8; 32];
+        let keygen_public = public_key(keygen.expose_secret());
+        let issuer_public = public_key(&issuer);
+        let from_keygen = shared_secret(keygen.expose_secret(), &issuer_public).unwrap();
+        let from_issuer = shared_secret(&issuer, &keygen_public).unwrap();
+        assert_eq!(from_keygen.expose_secret(), from_issuer.expose_secret());
+        assert_eq!(
+            access_code(from_keygen.expose_secret(), "alice"),
+            access_code(from_issuer.expose_secret(), "alice")
+        );
+    }
+
+    #[test]
+    fn a_low_order_public_key_is_rejected() {
+        let err = shared_secret(&vector_key(), &[0u8; 32]).unwrap_err();
+        assert!(err.contains("not contributory"));
+    }
+}

@@ -3870,7 +3870,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zns-canon"
 version = "0.1.0"
-source = "git+https://github.com/zcashme/zns-canon.git?branch=main#47e40a07f687e181509065cef029a1ac22a0a455"
+source = "git+https://github.com/zcashme/zns-canon.git?branch=main#fdcd854e8fae0053781194e3dc92b1ec7f8f1d23"
 dependencies = [
  "blake2b_simd",
  "chacha20poly1305 0.10.1",
@@ -3898,6 +3898,7 @@ version = "0.1.0"
 dependencies = [
  "blake2b_simd",
  "hex",
+ "hmac 0.12.1",
  "orchard",
  "rand 0.10.3",
  "sapling-crypto",
@@ -3905,10 +3906,12 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "x25519-dalek",
  "zcash_address",
  "zcash_keys",
  "zcash_primitives",

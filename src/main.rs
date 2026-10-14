@@ -27,16 +27,6 @@ const KEYS_DIR: &str = "keys";
 const CAPSULE_FILE: &str = "keys/zns_seed.capsule";
 const MANIFEST_FILE: &str = "keys/zns_custody_manifest.toml";
 const ATTESTATION_FILE: &str = "keys/zns_attestation.bin";
-const ACCESS_CODE_ENC_FILE: &str = "keys/access_code_key.enc";
-
-/// The operator public key the access-code key is wrapped to. Part of the
-/// measured image, so the attestation covers the choice of recipient. The
-/// matching private key is the operator's 24-word mnemonic; the wrap is
-/// canon's `wrap_secret`, and `access-code-tool decrypt` opens the file.
-const ISSUER_PUBKEY: [u8; 32] = [
-    0xfb, 0xd1, 0x2e, 0xed, 0x08, 0xb8, 0xc1, 0xe3, 0x43, 0xab, 0x4b, 0x98, 0x22, 0x82, 0x1d, 0x51,
-    0x13, 0xb0, 0xe3, 0xa7, 0x11, 0x00, 0x1d, 0x81, 0xed, 0xb8, 0xd5, 0xcf, 0xa3, 0x4e, 0xab, 0x52,
-];
 
 const TREASURY_ACCOUNT: u32 = 0;
 const REGISTRY_ACCOUNT: u32 = 1;
@@ -96,7 +86,6 @@ fn wipe_incomplete() {
     for path in [
         CAPSULE_FILE,
         ATTESTATION_FILE,
-        ACCESS_CODE_ENC_FILE,
         "keys/zns_mint.conf",
         "keys/ceremony_state.toml",
     ] {
@@ -108,8 +97,10 @@ fn wipe_incomplete() {
     }
 }
 
-/// Generate the seed, seal the capsule with the access-code key, derive
-/// the Treasury funding info, and wrap the access-code key to the operator.
+/// Generate the seed, seal the capsule, and derive the Treasury funding info.
+///
+/// The capsule is the seed alone. Access codes are a separate procedure and
+/// never enter this seal.
 fn seal_seed() -> SealedCeremony {
     let (fingerprint, capsule_hash, funding) = {
         let seed = generate_seed();
@@ -119,25 +110,17 @@ fn seal_seed() -> SealedCeremony {
 
         let funding = TreasuryFundingInfo::derive(&NETWORK, seed.expose_secret());
 
-        // Drawn from RDSEED like the seed, and sealed into the same capsule:
-        // the mint unseals both at boot, and migrate re-seals both with the
-        // seed. The claim-judging key never exists outside this guest until
-        // the operator decrypts their copy.
-        let access_code_key = generate_access_code_key();
-
         tracing::info!("=== SEALING ===");
         let sealing_key = zns_canon::sealing::derive_sealing_key(capsule::CAPSULE_KEY_CONTEXT)
             .unwrap_or_else(|error| panic!("FATAL: derive sealing key: {error}"));
-        let capsule = capsule::seal_seed(&sealing_key, &seed, &access_code_key, &mut RdseedRng)
+        let capsule = capsule::seal_seed(&sealing_key, &seed, &mut RdseedRng)
             .unwrap_or_else(|error| panic!("FATAL: seal capsule: {error}"));
         let capsule_bytes = capsule::serialize_capsule(&capsule)
             .unwrap_or_else(|error| panic!("FATAL: serialize capsule: {error}"));
         let capsule_hash = capsule::hash(&capsule_bytes);
         write_secret_file(Path::new(CAPSULE_FILE), &capsule_bytes);
-        export_access_code_key(&access_code_key, capsule_hash);
         tracing::info!("capsule persisted; dropping plaintext seed");
         drop(seed);
-        drop(access_code_key);
         (fingerprint, capsule_hash, funding)
     };
     SealedCeremony {
@@ -145,55 +128,6 @@ fn seal_seed() -> SealedCeremony {
         capsule_hash,
         funding,
     }
-}
-
-/// Draw the access-code key from RDSEED and reject degenerate output, the
-/// same as the seed.
-fn generate_access_code_key() -> Secret<[u8; 32]> {
-    let mut key_bytes = [0u8; 32];
-    fill_entropy(&mut key_bytes);
-    assert!(
-        !key_bytes.iter().all(|&b| b == 0),
-        "FATAL: RDSEED all zeros"
-    );
-    assert!(
-        !key_bytes.iter().all(|&b| b == 0xff),
-        "FATAL: RDSEED all 0xFF"
-    );
-    let key = Secret::new(key_bytes);
-    key_bytes.zeroize();
-    key
-}
-
-/// The offer the export wrap binds to: the operator's public key as the
-/// recipient, a fixed export domain as the nonce, and the capsule hash so
-/// the wrap opens only beside the capsule it was made with.
-fn export_offer(capsule_hash: [u8; 32]) -> zns_canon::migration::MigrationOffer {
-    zns_canon::migration::MigrationOffer {
-        ephemeral_pubkey: ISSUER_PUBKEY,
-        nonce: blake2b256(b"ZNS_ACCESS_CODE_EXPORT_V1"),
-        manifest_hash: capsule_hash,
-    }
-}
-
-/// Wrap the access-code key to [`ISSUER_PUBKEY`] and write the 200-byte
-/// export file: the offer, then the wrapped secret. The host can read the
-/// file and learns nothing; only the operator's private key opens it.
-fn export_access_code_key(access_code_key: &Secret<[u8; 32]>, capsule_hash: [u8; 32]) {
-    let offer = export_offer(capsule_hash);
-    let wrapped = zns_canon::migration::wrap_secret(access_code_key, &offer, &mut RdseedRng)
-        .unwrap_or_else(|error| panic!("FATAL: wrap access-code key: {error}"));
-    let mut file_bytes = Vec::with_capacity(200);
-    file_bytes.extend_from_slice(&offer.ephemeral_pubkey);
-    file_bytes.extend_from_slice(&offer.nonce);
-    file_bytes.extend_from_slice(&offer.manifest_hash);
-    file_bytes.extend_from_slice(&wrapped.sender_ephemeral_pubkey);
-    file_bytes.extend_from_slice(&wrapped.nonce);
-    file_bytes.extend_from_slice(&wrapped.ciphertext);
-    write_secret_file(Path::new(ACCESS_CODE_ENC_FILE), &file_bytes);
-    tracing::info!(
-        "access-code key sealed into the capsule; operator copy written to {ACCESS_CODE_ENC_FILE}"
-    );
 }
 
 /// Request the SNP attestation for the capsule and verify it.
@@ -239,9 +173,8 @@ fn build_anchor(
         .unwrap_or_else(|error| panic!("FATAL: parse capsule: {error}"));
     let sealing_key = zns_canon::sealing::derive_sealing_key(capsule::CAPSULE_KEY_CONTEXT)
         .unwrap_or_else(|error| panic!("FATAL: derive sealing key: {error}"));
-    let opened = capsule::unseal_seed(&sealing_key, &capsule)
+    let seed = capsule::unseal_seed(&sealing_key, &capsule)
         .unwrap_or_else(|error| panic!("FATAL: unseal capsule: {error}"));
-    let seed = opened.seed;
     let unsealed = SeedFingerprint::from_seed(seed.expose_secret()).expect("FATAL: seed length");
     assert_eq!(
         unsealed, sealed.fingerprint,
@@ -361,10 +294,6 @@ fn finalize(
     let report_data_hash = blake2b256(&attestation.report_data);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
-    let access_code_key_enc_hash = blake2b256(
-        &fs::read(ACCESS_CODE_ENC_FILE)
-            .unwrap_or_else(|error| panic!("FATAL: read {ACCESS_CODE_ENC_FILE}: {error}")),
-    );
     let treasury_address = sealed
         .funding
         .address()
@@ -381,7 +310,6 @@ fn finalize(
         measurement: &measurement,
         guest_policy: attestation.guest_policy,
         tcb_version: &attestation.tcb_version,
-        access_code_key_enc_hash: &access_code_key_enc_hash,
     });
     write_atomic(Path::new(MANIFEST_FILE), manifest.as_bytes(), 0o644);
     tracing::info!(birthday, "manifest written");
@@ -492,9 +420,6 @@ struct CustodyManifest {
     report_data_hash_blake2b256: String,
     measurement: String,
     attestation_sig_algo: &'static str,
-    access_code_key_file: &'static str,
-    access_code_key_recipient: String,
-    access_code_key_enc_hash_blake2b256: String,
     migration: &'static str,
     signer_socket: &'static str,
 }
@@ -510,7 +435,6 @@ struct CustodyManifestInputs<'a> {
     measurement: &'a str,
     guest_policy: u64,
     tcb_version: &'a str,
-    access_code_key_enc_hash: &'a [u8; 32],
 }
 
 fn custody_manifest(inputs: CustodyManifestInputs<'_>) -> String {
@@ -538,9 +462,6 @@ fn custody_manifest(inputs: CustodyManifestInputs<'_>) -> String {
         report_data_hash_blake2b256: hex::encode(inputs.report_data_hash),
         measurement: inputs.measurement.to_string(),
         attestation_sig_algo: "ecdsa-p384-sha384",
-        access_code_key_file: ACCESS_CODE_ENC_FILE,
-        access_code_key_recipient: hex::encode(ISSUER_PUBKEY),
-        access_code_key_enc_hash_blake2b256: hex::encode(inputs.access_code_key_enc_hash),
         migration: "none",
         signer_socket: "none",
     };
@@ -767,7 +688,6 @@ mod tests {
             measurement: &measurement,
             guest_policy: attestation.guest_policy,
             tcb_version: &attestation.tcb_version,
-            access_code_key_enc_hash: &[0x77; 32],
         });
         write_atomic(&manifest_path, manifest.as_bytes(), 0o644);
 
@@ -789,19 +709,12 @@ mod tests {
             hex::encode(sealed.capsule_hash)
         );
         assert_eq!(manifest["network"].as_str().unwrap(), NETWORK_LABEL);
-        assert_eq!(
-            manifest["access_code_key_file"].as_str().unwrap(),
-            ACCESS_CODE_ENC_FILE
-        );
-        assert_eq!(
-            manifest["access_code_key_recipient"].as_str().unwrap(),
-            hex::encode(ISSUER_PUBKEY)
-        );
-        assert_eq!(
-            manifest["access_code_key_enc_hash_blake2b256"]
-                .as_str()
-                .unwrap(),
-            hex::encode([0x77; 32])
+        assert!(manifest.get("access_code_key_file").is_none());
+        assert!(manifest.get("access_code_key_recipient").is_none());
+        assert!(
+            manifest
+                .get("access_code_key_enc_hash_blake2b256")
+                .is_none()
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -1,13 +1,13 @@
 //! Access codes, separate from the seed ceremony.
 //!
-//! The private key is `HMAC-SHA256(seed, "ZNS/access-code/x25519/v1")`.
-//! Running this tool with no arguments unseals the seed capsule, prints
-//! that key's X25519 public key, and drops the seed. Nothing is written.
-//! The issuer agrees their private key with the printed public key.
+//! `zns-keygen access-code` unseals the seed capsule, prints the X25519
+//! public key of `HMAC-SHA256(seed, "ZNS/access-code/x25519/v1")`, and drops
+//! the seed. Nothing is written. The issuer agrees their private key with
+//! the printed public key.
 //!
-//! `code <name>` derives the same private key and agrees it with the issuer's
-//! public key. The mint judges a name with that shared secret:
-//! `purpose = HMAC-SHA256(shared, "access-code-v1")`, then
+//! `zns-keygen access-code code <name>` derives the same private key and
+//! agrees it with the issuer's public key. The mint judges a name with that
+//! shared secret: `purpose = HMAC-SHA256(shared, "access-code-v1")`, then
 //! `u32_be(HMAC-SHA256(purpose, name)[0..4]) mod 1_000_000`.
 
 use hmac::{Hmac, Mac};
@@ -33,10 +33,11 @@ const PURPOSE: &[u8] = b"access-code-v1";
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn main() {
-    tracing_subscriber::fmt().init();
-    let mut args = std::env::args().skip(1);
-    match (args.next().as_deref(), args.next()) {
+pub fn run(args: impl Iterator<Item = String>) {
+    let mut args = args;
+    let command = args.next();
+    let name = args.next();
+    match (command.as_deref(), name) {
         (None, None) => print_public_key(),
         (Some("code"), Some(name)) => {
             if args.next().is_some() {
@@ -49,7 +50,7 @@ fn main() {
 }
 
 fn usage() -> ! {
-    panic!("FATAL: usage: zns-access-code | zns-access-code code <name>");
+    panic!("FATAL: usage: zns-keygen access-code | zns-keygen access-code code <name>");
 }
 
 fn print_public_key() {

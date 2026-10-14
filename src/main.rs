@@ -1,5 +1,6 @@
 //! zns-keygen — ZNS mint key genesis ceremony.
 
+mod access_code;
 mod anchor;
 mod ceremony;
 mod keys;
@@ -49,6 +50,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 fn main() {
     tracing_subscriber::fmt().init();
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("access-code") {
+        access_code::run(args);
+        return;
+    }
     tracing::info!("=== ZNS KEY GENESIS ===");
     tracing::info!(network = NETWORK_LABEL, "starting ceremony");
 

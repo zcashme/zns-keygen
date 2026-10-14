@@ -12,10 +12,6 @@ testnet = []
 name = "zns-keygen"
 path = "src/main.rs"
 
-[[bin]]
-name = "zns-access-code"
-path = "src/bin/zns-access-code.rs"
-
 [dependencies]
 blake2b_simd = "1.0.4"
 hex = "0.4.3"

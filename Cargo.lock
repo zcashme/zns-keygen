@@ -3870,7 +3870,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zns-canon"
 version = "0.1.0"
-source = "git+https://github.com/zcashme/zns-canon.git?branch=main#b72a4ffa2d6175e7a3796a217e73b5bfa734c7c6"
+source = "git+https://github.com/zcashme/zns-canon.git?branch=main#d127ec2f6f7b078e3c9f67f238e934c909e273fa"
 dependencies = [
  "blake2b_simd",
  "chacha20poly1305 0.10.1",

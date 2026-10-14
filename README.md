@@ -33,77 +33,68 @@ zns-keygen
 
 When the ceremony runs, `zns-keygen`:
 
-1. Resumes from `keys/ceremony_state.toml` when that file and the capsule are
-   both present. If the capsule exists without ceremony state, it refuses and
-   leaves the capsule in place. A new ceremony also refuses to start when the
-   manifest, mint config, or attestation file already exists.
-2. Generates a fresh 32-byte seed using `RDSEED`.
-3. Computes the ZIP-32 seed fingerprint locally:
+1. Checks for `keys/zns_custody_manifest.toml`. If it exists, the ceremony
+   is already complete and `zns-keygen` exits successfully without touching
+   anything.
+2. Removes any artifacts of an incomplete ceremony (`keys/zns_seed.capsule`,
+   `keys/zns_attestation.bin`, `keys/zns_mint.conf`), so every run starts
+   from a clean slate.
+3. Generates a fresh 32-byte seed using `RDSEED`.
+4. Computes the ZIP-32 seed fingerprint locally:
    `BLAKE2b-256(personal="Zcash_HD_Seed_FP", [seed_len] || seed)`, displayed as
    Bech32m with HRP `zip32seedfp`.
-4. Temporarily derives only the Treasury transparent funding address and the
+5. Temporarily derives only the Treasury transparent funding address and the
    external public key needed to identify the funding UTXO.
-5. Derives an SEV-SNP sealing key rooted in the AMD platform's SNP key
+6. Derives an SEV-SNP sealing key rooted in the AMD platform's SNP key
    hierarchy, bound to guest policy and measurement.
-6. Immediately encrypts the seed with `XChaCha20Poly1305`, binding the capsule
-   magic and seed fingerprint into the AAD (Additional Authenticated Data).
-7. Persists `keys/zns_seed.capsule` (postcard-serialized struct: magic + fingerprint
-   + nonce + ciphertext+tag), records `SEALED` in `keys/ceremony_state.toml`
-   with the Treasury address and public key, and drops the plaintext seed.
+7. Immediately encrypts the seed with `XChaCha20Poly1305`, binding the capsule
+   magic and seed fingerprint into the AAD (Additional Authenticated Data),
+   persists `keys/zns_seed.capsule` (postcard-serialized struct: magic + fingerprint
+   + nonce + ciphertext+tag), and drops the plaintext seed.
 8. Requests a SEV-SNP attestation bound to
    `BLAKE2b-512(seed_fingerprint ‖ capsule_hash)`. The VCEK and ASK are fetched
    from AMD KDS and checked against a pinned AMD ARK. The verified report is
-   persisted as `keys/zns_attestation.bin`. This happens before funding and
-   before any on-chain action. The state then becomes `WAITING_FOR_FUNDS`.
+   persisted as `keys/zns_attestation.bin` and verified again by reading it
+   back. This happens before funding and before any on-chain action.
 9. Displays the Treasury transparent funding address and waits for funding
    through Zebra. An empty address logs `no funding yet`. A failed Zebra query
    is logged and retried; it is not treated as an empty address. The seed does
    not remain in plaintext memory during this operator-controlled wait.
-   Observed funding is recorded as `FUNDED`.
 10. Unseals the capsule, derives the Treasury external index-0 signing key and
-    the Treasury and Registry Orchard full viewing keys, builds and signs the
-    genesis anchor, and persists that exact transaction as `ANCHOR_BUILT`
-    before broadcasting it. The plaintext seed and signing key are dropped
-    before the transaction is stored.
-11. Asks Zebra whether that txid is already known. If it is not, broadcasts the
-    stored transaction. Either way, persists `ANCHOR_SUBMITTED` and waits until
-    that same txid has 10 confirmations on the best chain. The birthday is the
-    height of the block that contains it. A mempool entry, a missing height, or
-    a failed Zebra query does not set a birthday and does not finish the
-    ceremony. A side-chain response (`height` of `-1`) is not a birthday
-    either. That transaction is no longer a mining candidate, so keygen
-    broadcasts the stored transaction again. Zebra can accept it back into the
-    mempool, or reject it as expired, which rebuilds one replacement.
-12. Persists `ANCHOR_BROADCAST` with that confirmed height, writes
-    `keys/zns_custody_manifest.toml` and `keys/zns_mint.conf`, records
-    `COMPLETE`, and exits.
+    the Treasury and Registry Orchard full viewing keys, and builds and signs
+    the genesis anchor. The plaintext seed and signing key are dropped as soon
+    as the transaction exists.
+11. Broadcasts that transaction and waits until its txid has 10 confirmations
+    on the best chain. The birthday is the height of the block that contains
+    it. A mempool entry, a missing height, or a failed Zebra query does not
+    set a birthday and does not finish the ceremony. If the node loses the
+    transaction or reports it only on a side chain, keygen broadcasts the
+    same transaction again. If Zebra rejects it as expired, the run fails;
+    the next start wipes and builds a fresh ceremony.
+12. Writes `keys/zns_mint.conf` and then `keys/zns_custody_manifest.toml`,
+    and exits. The manifest is written last: its existence is the completion
+    record.
 
 The ordering is:
 
-`generate seed → seal capsule → request and verify attestation → persist attestation → wait for funding → unseal → build, sign, and persist the anchor → broadcast → wait for 10 confirmations → persist txid and inclusion height → write manifest and mint config → complete`
+`generate seed → seal capsule → request, verify, and persist the attestation → wait for funding → unseal → build and sign the anchor → broadcast → wait for 10 confirmations → write mint config and custody manifest → exit`
 
-Restart continues from the persisted state:
-
-- `SEALED` requests and verifies attestation when it is not already stored, then waits for funding.
-- `WAITING_FOR_FUNDS` resumes the funding wait.
-- `FUNDED` constructs the anchor.
-- `ANCHOR_BUILT` checks whether that stored transaction was broadcast before sending it. If Zebra reports that the stored transaction expired before it was accepted, the ceremony returns to `FUNDED` and builds a new anchor at the current tip.
-- `ANCHOR_SUBMITTED` keeps waiting for the stored txid to reach 10 best-chain confirmations. It does not generate a seed or build another anchor because confirmation is still pending. If the txid disappears, or Zebra reports it only on a side chain, it rebroadcasts that same transaction. It builds a replacement only when Zebra rejects the stored transaction as expired, which returns the ceremony to `FUNDED`. A reorg before 10 confirmations resumes the wait, and the birthday is the height of the later best-chain inclusion.
-- `ANCHOR_BROADCAST` writes the manifest and mint config. Each file is created by a synced rename, and an existing file is accepted only when its bytes match. It does not unseal the seed or submit another transaction. The birthday stored here stays fixed.
-- `COMPLETE` exits successfully.
+Restarts are wipe-and-retry. The manifest is the only completion record: a
+boot that finds it exits successfully, and a boot that does not removes every
+other artifact under `keys/` and runs a fresh ceremony with a fresh seed.
+Funding sent to an abandoned ceremony's address stays there; this tool does
+not recover it.
 
 The capsule is the authoritative copy of the ceremony seed the moment it is
 durably written, which is before attestation and before the funding wait.
 Deleting the capsule and re-running generates a different seed and abandons
-the sealed one; that is not recovery. A capsule written before ceremony state
-existed cannot be resumed. This tool does not implement migration or recovery.
+the sealed one; that is not recovery. This tool does not implement migration or recovery.
 That support is planned future work and remains in scope for v1.
 
 Defaults:
 
 ```text
 capsule:      keys/zns_seed.capsule
-state:        keys/ceremony_state.toml
 manifest:     keys/zns_custody_manifest.toml
 mint_config:  keys/zns_mint.conf
 attestation:  keys/zns_attestation.bin
@@ -141,8 +132,7 @@ transaction, the transaction that creates the 40 Registry anchors. It is
 written only after that transaction has 10 confirmations. A broadcast, a
 mempool entry, or the chain tip does not establish it. Before those 10
 confirmations a reorg can move the transaction, and the ceremony keeps waiting
-for the later best-chain inclusion. After `ANCHOR_BROADCAST`, the value stays
-fixed.
+for the later best-chain inclusion. Once written, the value stays fixed.
 
 `zns-mint` reads this on startup and refuses to run if the decrypted seed's
 fingerprint does not match `expected_seed_fingerprint`.
@@ -208,7 +198,9 @@ Before writing, it verifies the report:
 - That ASK signs the VCEK, and the VCEK's ECDSA P-384 / SHA-384 signature covers the report.
 - `report_data` matches `BLAKE2b-512(seed_fingerprint || capsule_hash)`, and the measurement is not all zeros.
 
-A later resume reads `keys/zns_attestation.bin` and repeats that check: it fetches the VCEK and ASK again, verifies the signature, and only then copies the measurement and guest policy into the custody manifest.
+The report is written only after this verification, and keygen re-reads
+`keys/zns_attestation.bin` and repeats the check before the measurement and
+guest policy are copied into the custody manifest.
 
 The AMD PSP records the launch measurement in the report. A verifier outside the guest, the host or anyone reading `keys/zns_attestation.bin`, compares that value to the built image.
 

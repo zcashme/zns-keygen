@@ -55,6 +55,7 @@ fn usage() -> ! {
 fn print_public_key() {
     let public = access_public_key();
     tracing::info!("access-code public key: {}", hex::encode(public));
+    println!("{}", hex::encode(public));
 }
 
 fn code_for_name(name: &str) -> u32 {
@@ -123,9 +124,10 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
-    let out = mac.finalize().into_bytes();
+    let mut out = mac.finalize().into_bytes();
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&out);
+    out.zeroize();
     digest
 }
 
@@ -156,13 +158,14 @@ mod tests {
     #[test]
     fn the_public_key_is_determined_by_the_seed() {
         let seed = [0x11; SEED_LEN];
-        let first = private_key_from_seed(&seed);
-        let second = private_key_from_seed(&seed);
-        assert_eq!(first.expose_secret(), second.expose_secret());
-        assert_ne!(first.expose_secret(), &seed);
+        let private = private_key_from_seed(&seed);
         assert_eq!(
-            public_key(first.expose_secret()),
-            public_key(second.expose_secret())
+            hex::encode(private.expose_secret()),
+            "cf5784abd38e10d8de32aa90525d15f4f55384dfa5e107e3f1cc265fc372509e"
+        );
+        assert_eq!(
+            hex::encode(public_key(private.expose_secret())),
+            "2a6582c9964d8908f1557412e8b8edd27e94d25126f235c84fbf01b1a8879425"
         );
     }
 

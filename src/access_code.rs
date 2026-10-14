@@ -55,7 +55,6 @@ fn usage() -> ! {
 
 fn print_public_key() {
     let public = access_public_key();
-    tracing::info!("access-code public key: {}", hex::encode(public));
     println!("{}", hex::encode(public));
 }
 

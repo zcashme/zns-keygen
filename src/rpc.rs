@@ -24,9 +24,13 @@ impl Rpc {
             "params": params,
             "id": 0,
         });
-        let resp = ureq::post(RPC_URL)
+        let mut request = ureq::post(RPC_URL)
             .set("content-type", "application/json")
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(authorization) = cookie_header() {
+            request = request.set("authorization", &authorization);
+        }
+        let resp = request
             .send_json(serde_json::to_value(&body).expect("FATAL: encode RPC request"))
             .map_err(|e| format!("RPC transport: {e}"))?;
         let parsed: RpcResp<R> = resp.into_json().map_err(|e| format!("RPC decode: {e}"))?;
@@ -69,11 +73,8 @@ impl Rpc {
             serde_json::json!([txid, 1]),
         ) {
             Ok(value) => {
-                let (height, confirmations) = transaction_position(&value);
-                Ok(TxLookup::Found {
-                    height,
-                    confirmations,
-                })
+                let (height, block_hash) = transaction_position(&value);
+                Ok(TxLookup::Found { height, block_hash })
             }
             Err(message) if transaction_is_absent(&message) => Ok(TxLookup::Absent),
             Err(message) => Err(message),
@@ -85,22 +86,136 @@ impl Rpc {
 pub enum TxLookup {
     Absent,
     /// `height` is missing in the mempool and negative on a side chain.
-    /// `confirmations` is missing until the transaction is in a block.
+    /// `block_hash` is missing until the transaction is in a block.
     Found {
         height: Option<i64>,
-        confirmations: Option<u64>,
+        block_hash: Option<String>,
     },
 }
 
-/// Height and confirmation count from a verbose transaction object.
+/// The node has to serve this block. The same pins the mint uses.
+fn pinned() -> (u32, &'static str) {
+    #[cfg(feature = "testnet")]
+    {
+        (
+            4_238_000,
+            "0017b69a52b06033149cbb86f89488e7cfc525b3e5e98561a51b6ca271a0576e",
+        )
+    }
+    #[cfg(not(feature = "testnet"))]
+    {
+        (
+            3_353_606,
+            "00000000008b5211479a54c24191ff237efa3d39bb28b1cc696195eeff5e5605",
+        )
+    }
+}
+
+impl Rpc {
+    /// Refuses a node whose block at the pinned height is not the pinned hash.
+    pub fn pinned_block_ok() -> Result<(), String> {
+        let (height, expected) = pinned();
+        let actual = Self::block_hash(height)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!("block {height} is not the pinned block"));
+        }
+        Ok(())
+    }
+
+    /// Display hash of the block at `height`.
+    pub fn block_hash(height: u32) -> Result<String, String> {
+        Self::call("getblockhash", serde_json::json!([height]))
+    }
+
+    /// `true` when `depth - 1` previous-hash links from `tip_hash` land on `inclusion_hash`.
+    pub fn inclusion_under_tip(
+        tip_hash: &str,
+        inclusion_hash: &str,
+        depth: u32,
+    ) -> Result<bool, String> {
+        if depth == 0 {
+            return Ok(false);
+        }
+        let mut current = tip_hash.to_string();
+        for _ in 1..depth {
+            current = Self::previous_hash(&current)?;
+        }
+        Ok(current.eq_ignore_ascii_case(inclusion_hash))
+    }
+
+    fn previous_hash(hash: &str) -> Result<String, String> {
+        let header: serde_json::Value =
+            Self::call("getblockheader", serde_json::json!([hash, true]))?;
+        header
+            .get("previousblockhash")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "block header has no previous hash".to_string())
+    }
+}
+
+/// Height and block hash from a verbose transaction object.
 ///
-/// A negative height is preserved. It is not a best-chain inclusion.
-pub(crate) fn transaction_position(value: &serde_json::Value) -> (Option<i64>, Option<u64>) {
+/// A negative height is a side chain and is preserved.
+pub(crate) fn transaction_position(value: &serde_json::Value) -> (Option<i64>, Option<String>) {
     let height = value.get("height").and_then(serde_json::Value::as_i64);
-    let confirmations = value
-        .get("confirmations")
-        .and_then(serde_json::Value::as_u64);
-    (height, confirmations)
+    let block_hash = value
+        .get("blockhash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (height, block_hash)
+}
+
+/// HTTP basic auth for Zebra's cookie file, when that file exists.
+fn cookie_header() -> Option<String> {
+    let path =
+        std::env::var("ZEBRA_COOKIE_FILE").unwrap_or_else(|_| "/var/lib/zebra/.cookie".to_string());
+    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let pair = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("__cookie__:{raw}")
+    };
+    Some(format!("Basic {}", base64(&pair)))
+}
+
+fn base64(input: &str) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let chunk = ((bytes[index] as u32) << 16)
+            | ((bytes[index + 1] as u32) << 8)
+            | (bytes[index + 2] as u32);
+        out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
+        out.push(TABLE[((chunk >> 6) & 63) as usize] as char);
+        out.push(TABLE[(chunk & 63) as usize] as char);
+        index += 3;
+    }
+    match bytes.len() - index {
+        1 => {
+            let chunk = (bytes[index] as u32) << 16;
+            out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
+            out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let chunk = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+            out.push(TABLE[((chunk >> 18) & 63) as usize] as char);
+            out.push(TABLE[((chunk >> 12) & 63) as usize] as char);
+            out.push(TABLE[((chunk >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 /// True only for the RPC error Zebra and zcashd use when a txid is unknown.
@@ -157,7 +272,7 @@ pub struct AddressUtxo {
 
 #[cfg(test)]
 mod tests {
-    use super::{transaction_is_absent, transaction_is_expired, transaction_position};
+    use super::{base64, transaction_is_absent, transaction_is_expired, transaction_position};
 
     #[test]
     fn only_a_missing_transaction_counts_as_absent() {
@@ -180,17 +295,24 @@ mod tests {
     #[test]
     fn transaction_position_keeps_side_chain_and_mempool() {
         assert_eq!(
-            transaction_position(&serde_json::json!({"height": -1, "confirmations": 0})),
-            (Some(-1), Some(0))
+            transaction_position(&serde_json::json!({"height": -1, "confirmations": 100})),
+            (Some(-1), None)
         );
         assert_eq!(
-            transaction_position(&serde_json::json!({"hex": "00"})),
+            transaction_position(&serde_json::json!({"hex": "00", "confirmations": 10})),
             (None, None)
         );
         assert_eq!(
-            transaction_position(&serde_json::json!({"height": 4408922, "confirmations": 10})),
-            (Some(4408922), Some(10))
+            transaction_position(
+                &serde_json::json!({"height": 4408922, "confirmations": 10, "blockhash": "aa"})
+            ),
+            (Some(4408922), Some("aa".to_string()))
         );
+    }
+
+    #[test]
+    fn cookie_basic_auth_uses_the_cookie_user() {
+        assert_eq!(base64("__cookie__:ab"), "X19jb29raWVfXzphYg==");
     }
 
     #[test]

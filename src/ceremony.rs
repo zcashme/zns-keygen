@@ -45,6 +45,32 @@ pub enum BroadcastAction {
     Confirmed { birthday: u32 },
 }
 
+/// Blocks from `inclusion` up to and including `tip`. `None` when `inclusion` is above `tip`.
+pub fn depth_on_tip(tip: u32, inclusion: u32) -> Option<u32> {
+    tip.checked_sub(inclusion)?.checked_add(1)
+}
+
+/// Header steps followed from the tip. A deeper inclusion stays pending.
+pub const HEADER_WALK_LIMIT: u32 = 64;
+
+/// Confirmation count passed to [`classify_anchor`].
+///
+/// Below [`ANCHOR_CONFIRMATIONS`] this is the depth. Through
+/// [`HEADER_WALK_LIMIT`] it is the depth only when the inclusion is linked
+/// to the tip. Otherwise the anchor stays pending.
+pub fn confirmations_for_depth(depth: u32, linked: Option<bool>) -> Option<u64> {
+    if depth < ANCHOR_CONFIRMATIONS {
+        return Some(u64::from(depth));
+    }
+    if depth > HEADER_WALK_LIMIT {
+        return None;
+    }
+    match linked {
+        Some(true) => Some(u64::from(depth)),
+        Some(false) | None => None,
+    }
+}
+
 /// Classify a verbose `getrawtransaction` result.
 ///
 /// A missing height, a missing confirmation count, or fewer than
@@ -79,6 +105,63 @@ pub fn broadcast_action(lookup: AnchorLookup) -> BroadcastAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_is_the_inclusive_gap_from_inclusion_to_tip() {
+        assert_eq!(depth_on_tip(100, 100), Some(1));
+        assert_eq!(depth_on_tip(109, 100), Some(10));
+        assert_eq!(depth_on_tip(99, 100), None);
+    }
+
+    #[test]
+    fn only_a_linked_inclusion_at_ten_or_more_is_confirmed() {
+        let height = 100_i64;
+        let pending_shallow = classify_anchor(Some(height), confirmations_for_depth(9, None));
+        assert!(matches!(pending_shallow, AnchorLookup::Pending { .. }));
+
+        assert_eq!(
+            classify_anchor(Some(height), confirmations_for_depth(10, Some(true))),
+            AnchorLookup::Confirmed {
+                birthday: height as u32
+            }
+        );
+        assert_eq!(
+            classify_anchor(
+                Some(height),
+                confirmations_for_depth(HEADER_WALK_LIMIT, Some(true))
+            ),
+            AnchorLookup::Confirmed {
+                birthday: height as u32
+            }
+        );
+        let beyond_walk = classify_anchor(
+            Some(height),
+            confirmations_for_depth(HEADER_WALK_LIMIT + 1, Some(true)),
+        );
+        assert!(matches!(
+            beyond_walk,
+            AnchorLookup::Pending {
+                confirmations: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            broadcast_action(beyond_walk),
+            BroadcastAction::AwaitConfirmation
+        );
+
+        for linked in [Some(false), None] {
+            let lookup = classify_anchor(Some(height), confirmations_for_depth(10, linked));
+            assert!(matches!(
+                lookup,
+                AnchorLookup::Pending {
+                    confirmations: None,
+                    ..
+                }
+            ));
+            assert_eq!(broadcast_action(lookup), BroadcastAction::AwaitConfirmation);
+        }
+    }
 
     #[test]
     fn absent_transaction_is_sent_once() {

@@ -223,6 +223,7 @@ fn build_anchor(
 /// rejection fails the run: the next start wipes and builds a fresh ceremony.
 fn broadcast_and_confirm(txid: &str, raw_tx: &str) -> u32 {
     tracing::info!(txid, "=== BROADCAST ===");
+    require_pinned_block();
     send_anchor(txid, raw_tx);
     loop {
         let lookup = anchor_lookup(txid);
@@ -273,18 +274,82 @@ fn send_anchor(txid: &str, raw_tx: &str) {
     }
 }
 
+fn require_pinned_block() {
+    loop {
+        match rpc::Rpc::pinned_block_ok() {
+            Ok(()) => {
+                tracing::info!("pinned block present");
+                return;
+            }
+            Err(error) if error.contains("is not the pinned block") => {
+                panic!("FATAL: {error}");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "pinned block unavailable; retrying");
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+/// How many header steps to follow from the tip. Deeper than this, the
+/// inclusion hash is checked at its height and the pinned block already
+/// identified the chain.
+const HEADER_WALK_LIMIT: u32 = 64;
+
 fn anchor_lookup(txid: &str) -> ceremony::AnchorLookup {
     loop {
         match rpc::Rpc::transaction_presence(txid) {
             Ok(rpc::TxLookup::Absent) => return ceremony::AnchorLookup::Absent,
-            Ok(rpc::TxLookup::Found {
-                height,
-                confirmations,
-            }) => return ceremony::classify_anchor(height, confirmations),
+            Ok(rpc::TxLookup::Found { height, block_hash }) => {
+                return lookup_from_position(height, block_hash);
+            }
             Err(error) => {
                 tracing::warn!(%error, txid, "anchor lookup failed; retrying");
                 std::thread::sleep(POLL_INTERVAL);
             }
+        }
+    }
+}
+
+/// Depth is `tip - inclusion + 1`, from the tip hash and the inclusion block hash.
+fn lookup_from_position(height: Option<i64>, block_hash: Option<String>) -> ceremony::AnchorLookup {
+    let Some(height) = height else {
+        return ceremony::classify_anchor(None, None);
+    };
+    if height < 0 {
+        return ceremony::classify_anchor(Some(height), None);
+    }
+    let Ok(inclusion) = u32::try_from(height) else {
+        return ceremony::classify_anchor(Some(height), None);
+    };
+    let Some(block_hash) = block_hash else {
+        return ceremony::classify_anchor(Some(height), None);
+    };
+    let (tip, tip_hash) = match rpc::Rpc::tip() {
+        Ok(tip) => tip,
+        Err(error) => {
+            tracing::warn!(%error, "tip unavailable; anchor stays pending");
+            return ceremony::classify_anchor(Some(height), None);
+        }
+    };
+    let Some(depth) = ceremony::depth_on_tip(u32::from(tip), inclusion) else {
+        return ceremony::classify_anchor(Some(height), None);
+    };
+    if depth < ceremony::ANCHOR_CONFIRMATIONS {
+        return ceremony::classify_anchor(Some(height), Some(u64::from(depth)));
+    }
+    let linked = if depth <= HEADER_WALK_LIMIT {
+        rpc::Rpc::inclusion_under_tip(&tip_hash, &block_hash, depth)
+    } else {
+        rpc::Rpc::block_hash(inclusion).map(|hash| hash.eq_ignore_ascii_case(&block_hash))
+    };
+    match linked {
+        Ok(true) => ceremony::classify_anchor(Some(height), Some(u64::from(depth))),
+        Ok(false) => ceremony::classify_anchor(Some(height), None),
+        Err(error) => {
+            tracing::warn!(%error, "anchor chain link unavailable; staying pending");
+            ceremony::classify_anchor(Some(height), None)
         }
     }
 }
@@ -518,13 +583,16 @@ fn fill_entropy(dest: &mut [u8]) {
     }
 }
 
-/// Fallback entropy (dev only).
+/// A build off x86_64 Linux does not compile. A call here aborts.
+#[cfg(all(
+    not(any(test, clippy)),
+    not(all(target_arch = "x86_64", target_os = "linux"))
+))]
+compile_error!("zns-keygen requires x86_64 Linux with RDSEED");
+
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-fn fill_entropy(dest: &mut [u8]) {
-    use std::io::Read;
-    std::io::stdin()
-        .read_exact(dest)
-        .expect("FATAL: entropy unavailable");
+fn fill_entropy(_dest: &mut [u8]) {
+    panic!("FATAL: zns-keygen requires x86_64 Linux with RDSEED");
 }
 
 /// Draws the ceremony seed from RDSEED and rejects a degenerate output.

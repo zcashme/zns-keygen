@@ -1,6 +1,8 @@
 [network]
 network = "Testnet"
-listen_addr = "[::]:18233"
+# Inbound peers on loopback only, so the host cannot open the peer
+# that satisfies readiness. Outbound connections still open.
+listen_addr = "127.0.0.1:18233"
 
 [state]
 cache_dir = "/var/lib/zebra"
@@ -8,12 +10,12 @@ ephemeral = false
 
 [rpc]
 listen_addr = "127.0.0.1:18232"
-enable_cookie_auth = false
+enable_cookie_auth = true
 parallel_cpu_threads = 0
 
 [health]
 listen_addr = "127.0.0.1:8080"
-min_connected_peers = 1
+min_connected_peers = 2
 ready_max_blocks_behind = 2
 ready_max_tip_age = "5m"
 enforce_on_test_networks = true

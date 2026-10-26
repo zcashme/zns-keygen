@@ -5,6 +5,11 @@ export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
 echo "=== ZNS TESTNET GUEST INIT ==="
 
+fatal() {
+    echo "FATAL: $*"
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Early userspace
 # ---------------------------------------------------------------------------
@@ -20,8 +25,7 @@ mount -t tmpfs tmpfs /run 2>/dev/null || true
 modprobe sev-guest 2>/dev/null || true
 
 if [ ! -e /dev/sev-guest ]; then
-    echo "FATAL: /dev/sev-guest is unavailable"
-    exec sh
+    fatal "/dev/sev-guest is unavailable"
 fi
 
 # ---------------------------------------------------------------------------
@@ -42,8 +46,7 @@ ZNS_DEV="$(blkid -U "$ZNS_UUID")"
 ZEBRA_DEV="$(blkid -U "$ZEBRA_UUID")"
 
 if [ -z "$ZNS_DEV" ] || [ -z "$ZEBRA_DEV" ]; then
-    echo "FATAL: could not resolve persistent volume UUIDs"
-    exec sh
+    fatal "could not resolve persistent volume UUIDs"
 fi
 
 echo "Mounting ZNS state from $ZNS_DEV..."
@@ -71,8 +74,7 @@ for iface in /sys/class/net/*; do
 done
 
 if [ -z "$NIC" ]; then
-    echo "FATAL: no network interface found"
-    exec sh
+    fatal "no network interface found"
 fi
 
 echo "Using network interface: $NIC"
@@ -85,8 +87,7 @@ ipconfig -c dhcp -t 30 "$NIC"
 NETCONF="/run/net-${NIC}.conf"
 
 if [ ! -f "$NETCONF" ]; then
-    echo "FATAL: DHCP succeeded but $NETCONF was not created"
-    exec sh
+    fatal "DHCP succeeded but $NETCONF was not created"
 fi
 
 # ipconfig writes values including:
@@ -109,8 +110,7 @@ for dns in "${IPV4DNS0:-}" "${IPV4DNS1:-}"; do
 done
 
 if [ ! -s /etc/resolv.conf ]; then
-    echo "FATAL: DHCP supplied no usable DNS servers"
-    exec sh
+    fatal "DHCP supplied no usable DNS servers"
 fi
 
 echo "DNS configuration:"
@@ -130,9 +130,8 @@ echo "Waiting for Zebra health..."
 
 while true; do
     if ! kill -0 "$ZEBRA_PID" 2>/dev/null; then
-        echo "FATAL: zebrad exited before becoming healthy"
         wait "$ZEBRA_PID" || true
-        exec sh
+        fatal "zebrad exited before becoming healthy"
     fi
 
     if wget -q -O /tmp/zebra-health http://127.0.0.1:8080/healthy; then
@@ -147,9 +146,8 @@ echo "Waiting for Zebra readiness..."
 
 while true; do
     if ! kill -0 "$ZEBRA_PID" 2>/dev/null; then
-        echo "FATAL: zebrad exited before becoming ready"
         wait "$ZEBRA_PID" || true
-        exec sh
+        fatal "zebrad exited before becoming ready"
     fi
 
     if wget -q -O /tmp/zebra-ready http://127.0.0.1:8080/ready; then
@@ -160,8 +158,6 @@ while true; do
     sleep 2
 done
 
-# Zebra is ready. TODO: Automatic testnet keygen launch.
-wait "$ZEBRA_PID"
-
-echo "Zebra exited."
-exec sh
+# Zebra is ready. The ceremony binary is on the image PATH.
+export PATH="/usr/local/bin:$PATH"
+exec zns-keygen

@@ -45,3 +45,9 @@ zcash_script = "0.6"
 
 [dev-dependencies]
 zcash_keys = { version = "=0.17.0-pre.1", default-features = false, features = ["orchard", "sapling", "transparent-inputs"] }
+
+# Same forks the mint pins. Ordinary anchor notes do not call the ZNS
+# commitment API; the patch keeps the serialization those notes use.
+[patch.crates-io]
+orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.16.0-pre.1" }
+zcash_primitives = { git = "https://github.com/zcashme/zns-zcash_primitives.git", tag = "zns-zcash_primitives-v0.31.0-pre.1" }

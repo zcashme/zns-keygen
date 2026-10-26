@@ -1678,8 +1678,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae7ceb7b5387bd76cf3c0712f57708795c925cecf097036cedb60b5c3706e8f"
+source = "git+https://github.com/zcashme/orchard.git?tag=zns-orchard-v0.16.0-pre.1#6ffdf4ef8825b15b4e436252b6da4e0182ae5d74"
 dependencies = [
  "aes",
  "bitvec",
@@ -3665,8 +3664,7 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.31.0-pre.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0329bee4107df1aaaaaab365bdf94fcc0d9a185165c4675dff2397c5af7d13f4"
+source = "git+https://github.com/zcashme/zns-zcash_primitives.git?tag=zns-zcash_primitives-v0.31.0-pre.1#62316cef72f3a2e395f7aa8a936385c8c2467f78"
 dependencies = [
  "blake2b_simd",
  "corez",

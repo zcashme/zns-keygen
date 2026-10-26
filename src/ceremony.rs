@@ -45,6 +45,11 @@ pub enum BroadcastAction {
     Confirmed { birthday: u32 },
 }
 
+/// Blocks from `inclusion` up to and including `tip`. `None` when `inclusion` is above `tip`.
+pub fn depth_on_tip(tip: u32, inclusion: u32) -> Option<u32> {
+    tip.checked_sub(inclusion)?.checked_add(1)
+}
+
 /// Classify a verbose `getrawtransaction` result.
 ///
 /// A missing height, a missing confirmation count, or fewer than
@@ -79,6 +84,13 @@ pub fn broadcast_action(lookup: AnchorLookup) -> BroadcastAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_is_the_inclusive_gap_from_inclusion_to_tip() {
+        assert_eq!(depth_on_tip(100, 100), Some(1));
+        assert_eq!(depth_on_tip(109, 100), Some(10));
+        assert_eq!(depth_on_tip(99, 100), None);
+    }
 
     #[test]
     fn absent_transaction_is_sent_once() {

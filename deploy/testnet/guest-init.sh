@@ -158,6 +158,8 @@ while true; do
     sleep 2
 done
 
-# Zebra is ready. The ceremony binary is on the image PATH.
+# The ceremony writes keys/ relative to its working directory.
+# /state is the persistent volume.
+cd /state
 export PATH="/usr/local/bin:$PATH"
 exec zns-keygen

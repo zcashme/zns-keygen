@@ -292,11 +292,6 @@ fn require_pinned_block() {
     }
 }
 
-/// How many header steps to follow from the tip. Deeper than this, the
-/// inclusion hash is checked at its height and the pinned block already
-/// identified the chain.
-const HEADER_WALK_LIMIT: u32 = 64;
-
 fn anchor_lookup(txid: &str) -> ceremony::AnchorLookup {
     loop {
         match rpc::Rpc::transaction_presence(txid) {
@@ -336,22 +331,29 @@ fn lookup_from_position(height: Option<i64>, block_hash: Option<String>) -> cere
     let Some(depth) = ceremony::depth_on_tip(u32::from(tip), inclusion) else {
         return ceremony::classify_anchor(Some(height), None);
     };
-    if depth < ceremony::ANCHOR_CONFIRMATIONS {
-        return ceremony::classify_anchor(Some(height), Some(u64::from(depth)));
-    }
-    let linked = if depth <= HEADER_WALK_LIMIT {
-        rpc::Rpc::inclusion_under_tip(&tip_hash, &block_hash, depth)
+    let linked = if depth < ceremony::ANCHOR_CONFIRMATIONS {
+        None
     } else {
-        rpc::Rpc::block_hash(inclusion).map(|hash| hash.eq_ignore_ascii_case(&block_hash))
-    };
-    match linked {
-        Ok(true) => ceremony::classify_anchor(Some(height), Some(u64::from(depth))),
-        Ok(false) => ceremony::classify_anchor(Some(height), None),
-        Err(error) => {
-            tracing::warn!(%error, "anchor chain link unavailable; staying pending");
-            ceremony::classify_anchor(Some(height), None)
+        let checked = match ceremony::inclusion_check(depth) {
+            ceremony::InclusionCheck::WalkFromTip => {
+                rpc::Rpc::inclusion_under_tip(&tip_hash, &block_hash, depth)
+            }
+            ceremony::InclusionCheck::HashAtHeight => {
+                rpc::Rpc::block_hash(inclusion).map(|hash| hash.eq_ignore_ascii_case(&block_hash))
+            }
+        };
+        match checked {
+            Ok(linked) => Some(linked),
+            Err(error) => {
+                tracing::warn!(%error, "anchor chain link unavailable; staying pending");
+                None
+            }
         }
-    }
+    };
+    ceremony::classify_anchor(
+        Some(height),
+        ceremony::confirmations_for_depth(depth, linked),
+    )
 }
 
 /// Write the custody manifest: the mint's ceremony input, and its existence

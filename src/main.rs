@@ -331,18 +331,18 @@ fn lookup_from_position(height: Option<i64>, block_hash: Option<String>) -> cere
     let Some(depth) = ceremony::depth_on_tip(u32::from(tip), inclusion) else {
         return ceremony::classify_anchor(Some(height), None);
     };
-    let linked = if depth < ceremony::ANCHOR_CONFIRMATIONS {
+    let linked = if !(ceremony::ANCHOR_CONFIRMATIONS..=ceremony::HEADER_WALK_LIMIT).contains(&depth)
+    {
+        if depth > ceremony::HEADER_WALK_LIMIT {
+            tracing::warn!(
+                depth,
+                limit = ceremony::HEADER_WALK_LIMIT,
+                "inclusion is deeper than the header walk; anchor stays pending"
+            );
+        }
         None
     } else {
-        let checked = match ceremony::inclusion_check(depth) {
-            ceremony::InclusionCheck::WalkFromTip => {
-                rpc::Rpc::inclusion_under_tip(&tip_hash, &block_hash, depth)
-            }
-            ceremony::InclusionCheck::HashAtHeight => {
-                rpc::Rpc::block_hash(inclusion).map(|hash| hash.eq_ignore_ascii_case(&block_hash))
-            }
-        };
-        match checked {
+        match rpc::Rpc::inclusion_under_tip(&tip_hash, &block_hash, depth) {
             Ok(linked) => Some(linked),
             Err(error) => {
                 tracing::warn!(%error, "anchor chain link unavailable; staying pending");

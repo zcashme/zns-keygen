@@ -307,15 +307,18 @@ mod tests {
         }
     }
 
-    /// Mainnet NU7 activation is unset in zcash_protocol 0.11.0-pre; heights past
-    /// Nu6.3 activation must keep signing with the Nu6.3 branch ID.
+    /// NU7 activates on mainnet at height 3543405 with consensus branch ID
+    /// 0x77190ad9; the block before it still signs with Nu6.3's 0x37a5165b.
     #[test]
-    fn mainnet_keeps_nu6_3_branch_id() {
-        let height = BlockHeight::from_u32(5_000_000);
-        assert_eq!(
-            u32::from(BranchId::for_height(&MAIN_NETWORK, height)),
-            0x37a5_165b,
-        );
+    fn mainnet_signs_with_nu7_branch_id_from_activation() {
+        let branch = |height| {
+            u32::from(BranchId::for_height(
+                &MAIN_NETWORK,
+                BlockHeight::from_u32(height),
+            ))
+        };
+        assert_eq!(branch(3_543_404), 0x37a5_165b);
+        assert_eq!(branch(3_543_405), 0x7719_0ad9);
     }
 
     /// ZIP 259: NU7 activates on testnet at height 4465026 with consensus

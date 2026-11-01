@@ -1,6 +1,5 @@
 //! Anchor transaction builder.
 
-use blake2b_simd::Hash as Blake2bHash;
 use orchard::builder::{Builder as OrchardBuilder, BundleType};
 use orchard::bundle::BundleVersion;
 use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
@@ -10,9 +9,8 @@ use zcash_primitives::transaction::fees::FeeRule as _;
 use zcash_primitives::transaction::fees::transparent::InputView as _;
 use zcash_primitives::transaction::fees::zip317::FeeRule;
 use zcash_primitives::transaction::{
-    self, Authorization, TransactionData, TxDigests,
-    sighash::{SignableInput, signature_hash},
-    txid::TxIdDigester,
+    self, Authorization, TransactionData,
+    sighash::{PrecomputedSighashData, SignableInput},
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
@@ -141,18 +139,18 @@ pub fn build_anchor_transaction<P: Parameters>(
     );
 
     // ── 4. Compute txid digest + sighashes ──────────────────────
-    let txid_parts = unauthed_tx.digest(TxIdDigester);
+    let sighash = PrecomputedSighashData::new_zip244(unauthed_tx)
+        .unwrap_or_else(|_| panic!("FATAL: v6 sighash"));
 
     // ── 5. Authorize transparent inputs ─────────────────────────
     // The signing key is erased once the signatures exist, before the
     // Ironwood proof.
-    let authorized_transparent = transparent_bundle.map(|bundle| {
-        authorize_transparent(bundle, inputs, &unauthed_tx, &txid_parts, treasury_sk)
-    });
+    let authorized_transparent = transparent_bundle
+        .map(|bundle| authorize_transparent(bundle, inputs, &sighash, treasury_sk));
 
     // ── 6. Create Ironwood proof + sign ─────────────────────────
     // Output-only bundle: all spends are dummies, auto-signed by prepare.
-    let shielded_sighash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
+    let shielded_sighash = sighash.signature_hash(&SignableInput::Shielded);
 
     let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
 
@@ -182,8 +180,7 @@ pub fn build_anchor_transaction<P: Parameters>(
 fn authorize_transparent(
     bundle: transparent::bundle::Bundle<transparent::builder::Unauthorized>,
     inputs: &[TransparentInputInfo],
-    unauthed_tx: &TransactionData<UnauthorizedTx>,
-    txid_parts: &TxDigests<Blake2bHash>,
+    sighash: &PrecomputedSighashData<UnauthorizedTx>,
     treasury_sk: &mut secp256k1::SecretKey,
 ) -> transparent::bundle::Bundle<transparent::bundle::Authorized> {
     let signatures = {
@@ -203,12 +200,8 @@ fn authorize_transparent(
                     script,
                     info.coin().value(),
                 )?;
-                let sighash = signature_hash(
-                    unauthed_tx,
-                    &SignableInput::Transparent(signable),
-                    txid_parts,
-                );
-                let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+                let digest = sighash.signature_hash(&SignableInput::Transparent(signable));
+                let msg = secp256k1::Message::from_digest(*digest.as_ref());
                 Ok(sign(msg, treasury_sk))
             })
             .collect();
@@ -218,7 +211,9 @@ fn authorize_transparent(
 
     bundle
         .prepare_transparent_signatures(|input| {
-            *signature_hash(unauthed_tx, &SignableInput::Transparent(input), txid_parts).as_ref()
+            *sighash
+                .signature_hash(&SignableInput::Transparent(input))
+                .as_ref()
         })
         .expect("FATAL: prepare transparent signatures")
         .append_external_signatures(&signatures)
@@ -278,8 +273,10 @@ mod tests {
             None,
             None,
         );
-        let txid_parts = unauthed.digest(TxIdDigester);
-        let authorized = authorize_transparent(bundle, &inputs, &unauthed, &txid_parts, &mut sk);
+        let unauth_bundle = bundle.clone();
+        let sighash =
+            PrecomputedSighashData::new_zip244(unauthed).unwrap_or_else(|_| panic!("v6 sighash"));
+        let authorized = authorize_transparent(bundle, &inputs, &sighash, &mut sk);
 
         assert_eq!(
             sk.to_secret_bytes(),
@@ -287,12 +284,11 @@ mod tests {
             "signing key should be overwritten after signing"
         );
 
-        let unauth_bundle = unauthed.transparent_bundle().expect("transparent bundle");
         assert_eq!(authorized.vin.len(), inputs.len());
         for (index, txin) in authorized.vin.iter().enumerate() {
             let script = inputs[index].coin().script_pubkey();
             let signable = transparent::sighash::SignableInput::from_parts(
-                unauth_bundle,
+                &unauth_bundle,
                 transparent::sighash::SighashType::ALL,
                 index,
                 script,
@@ -300,30 +296,29 @@ mod tests {
                 inputs[index].coin().value(),
             )
             .expect("sighash input");
-            let sighash = signature_hash(
-                &unauthed,
-                &SignableInput::Transparent(signable),
-                &txid_parts,
-            );
+            let digest = sighash.signature_hash(&SignableInput::Transparent(signable));
             let bytes = txin.script_sig().0.to_bytes();
             let sig_len = bytes[0] as usize;
             let pushed = &bytes[1..1 + sig_len];
             let signature =
                 ecdsa::Signature::from_der(&pushed[..pushed.len() - 1]).expect("DER signature");
-            ecdsa::verify(&signature, Message::from_digest(*sighash.as_ref()), &pubkey)
+            ecdsa::verify(&signature, Message::from_digest(*digest.as_ref()), &pubkey)
                 .expect("signature verifies");
         }
     }
 
-    /// Mainnet NU7 activation is unset in zcash_protocol 0.11.0-pre; heights past
-    /// Nu6.3 activation must keep signing with the Nu6.3 branch ID.
+    /// NU7 activates on mainnet at height 3543405 with consensus branch ID
+    /// 0x77190ad9; the block before it still signs with Nu6.3's 0x37a5165b.
     #[test]
-    fn mainnet_keeps_nu6_3_branch_id() {
-        let height = BlockHeight::from_u32(5_000_000);
-        assert_eq!(
-            u32::from(BranchId::for_height(&MAIN_NETWORK, height)),
-            0x37a5_165b,
-        );
+    fn mainnet_signs_with_nu7_branch_id_from_activation() {
+        let branch = |height| {
+            u32::from(BranchId::for_height(
+                &MAIN_NETWORK,
+                BlockHeight::from_u32(height),
+            ))
+        };
+        assert_eq!(branch(3_543_404), 0x37a5_165b);
+        assert_eq!(branch(3_543_405), 0x7719_0ad9);
     }
 
     /// ZIP 259: NU7 activates on testnet at height 4465026 with consensus

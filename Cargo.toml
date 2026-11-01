@@ -34,6 +34,9 @@ zcash_primitives = { version = "0.31", default-features = false, features = ["tr
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 orchard = { version = "0.16.0", default-features = false, features = ["circuit"] }
 transparent = { package = "zcash_transparent", version = "0.11", default-features = false }
+# `Receiver::Transparent` encodes the Treasury t-address; zcash_transparent
+# 0.11 no longer does.
+zcash_keys = { version = "0.17", default-features = false }
 zip32 = "0.3"
 rand = "0.10"
 secp256k1 = "0.33"

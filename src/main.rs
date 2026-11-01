@@ -16,6 +16,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
+use zcash_keys::address::Receiver;
 use zcash_protocol::consensus::Parameters;
 use zcash_protocol::value::Zatoshis;
 use zeroize::Zeroize;
@@ -157,8 +158,7 @@ fn attest(fingerprint: SeedFingerprint) -> zns_canon::attestation::Attestation {
 fn wait_for_funding(
     funding: &TreasuryFundingInfo,
 ) -> Vec<transparent::builder::TransparentInputInfo> {
-    let taddr_encoded = funding
-        .address()
+    let taddr_encoded = Receiver::Transparent(*funding.address())
         .to_zcash_address(NETWORK.network_type())
         .encode();
     tracing::info!("=== FUNDING ===");
@@ -367,9 +367,7 @@ fn finalize(
     let report_data_hash = blake2b256(&attestation.report_data);
     let attestation_hash = blake2b256(&attestation.report_bytes);
     let measurement = hex::encode(attestation.measurement);
-    let treasury_address = sealed
-        .funding
-        .address()
+    let treasury_address = Receiver::Transparent(*sealed.funding.address())
         .to_zcash_address(NETWORK.network_type())
         .encode();
     let manifest = custody_manifest(CustodyManifestInputs {
@@ -413,7 +411,9 @@ fn poll_until_funded(
 /// An empty address is "no funding yet". A Zebra failure is logged and
 /// retried by the caller. It is not treated as an empty address.
 fn check_funding(addr: &transparent::address::TransparentAddress) -> Option<Vec<rpc::AddressUtxo>> {
-    let encoded = addr.to_zcash_address(NETWORK.network_type()).encode();
+    let encoded = Receiver::Transparent(*addr)
+        .to_zcash_address(NETWORK.network_type())
+        .encode();
     match funding_utxos(rpc::Rpc::address_utxos(&encoded)) {
         Ok(Some(utxos)) => Some(utxos),
         Ok(None) => {
@@ -748,9 +748,7 @@ mod tests {
         let report_data_hash = blake2b256(&attestation.report_data);
         let attestation_hash = blake2b256(&attestation.report_bytes);
         let measurement = hex::encode(attestation.measurement);
-        let treasury_address = sealed
-            .funding
-            .address()
+        let treasury_address = Receiver::Transparent(*sealed.funding.address())
             .to_zcash_address(NETWORK.network_type())
             .encode();
         let manifest = custody_manifest(CustodyManifestInputs {
